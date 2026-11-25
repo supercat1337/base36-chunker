@@ -76,7 +76,7 @@ export function crc8(bytes) {
  * @returns {number}
  */
 export function computeChecksum(bytes, algorithm) {
-    if (algorithm === 'crc16') return crc16(bytes);
-    if (algorithm === 'crc8') return crc8(bytes);
+    if (algorithm === 'crc16') {return crc16(bytes);}
+    if (algorithm === 'crc8') {return crc8(bytes);}
     throw new Error(`Unknown checksum algorithm: ${algorithm}`);
 }

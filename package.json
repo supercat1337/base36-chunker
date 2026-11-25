@@ -1,10 +1,14 @@
 {
     "name": "@supercat1337/base36-chunker",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "description": "Split text into base36-only lines (a-z0-9, never starting with a digit) with embedded metadata and reassemble it losslessly.",
     "author": "Albert Bazaleev",
     "license": "MIT",
     "type": "module",
+    "sideEffects": false,
+    "engines": {
+        "node": ">=19"
+    },
     "exports": {
         ".": {
             "types": "./dist/types.d.ts",
@@ -17,7 +21,7 @@
         "clean": "shx rm -rf ./dist && shx mkdir ./dist",
         "build_esm": "rollup ./src/index.js --file ./dist/base36-chunker.esm.js --format es",
         "build_esm_bundle": "esbuild ./src/index.js --format=esm --bundle --platform=neutral --outfile=./dist/base36-chunker.esm.bundle.js",
-        "gen_types": "npx tsc --project my.tsconfig.types.json && shx cp src/index.d.ts dist/types-temp/src/index.d.ts",
+        "gen_types": "tsc --project my.tsconfig.types.json && shx cp src/index.d.ts dist/types-temp/src/index.d.ts",
         "bundle_types": "api-extractor run --local",
         "build": "npm run clean && npm run build_esm && npm run build_esm_bundle && npm run gen_types && npm run bundle_types && shx rm -rf dist/types-temp",
         "lint": "eslint src/ tests/",
@@ -25,9 +29,15 @@
     },
     "devDependencies": {
         "@microsoft/api-extractor": "^7.59.4",
-        "ava": "^8.0.1",
-        "c8": "^9.1.0",
-        "shx": "^0.4.0"
+        "ava": "^6.1.0",
+        "c8": "^10.1.0",
+        "esbuild": "^0.25.0",
+        "eslint": "^10.15.0",
+        "eslint-plugin-jsdoc": "^63.3.3",
+        "globals": "^17.14.0",
+        "rollup": "^4.30.0",
+        "shx": "^0.4.0",
+        "typescript": "^5.7.0"
     },
     "keywords": [
         "base36",

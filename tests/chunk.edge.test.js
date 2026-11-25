@@ -2,8 +2,9 @@
 
 import test from 'ava';
 
-import { formatChunk, parseChunk } from '../src/chunk.js';
+import { formatChunk, parseChunk, validateSessionId } from '../src/chunk.js';
 import { DEFAULT_CONFIG } from '../src/config.js';
+import { chunksFromLines } from '../src/decode.js';
 
 const { maxIndex, maxTotal, maxByteCount } = DEFAULT_CONFIG;
 
@@ -11,7 +12,10 @@ const { maxIndex, maxTotal, maxByteCount } = DEFAULT_CONFIG;
 
 test('formatChunk: rejects non-string session', t => {
     t.throws(
-        () => formatChunk(/** @type {any} */ ({ session: 123, index: 0, total: 1, bytes: new Uint8Array() })),
+        () =>
+            formatChunk(
+                /** @type {any} */ ({ session: 123, index: 0, total: 1, bytes: new Uint8Array() })
+            ),
         { message: /6-character string/ }
     );
 });
@@ -74,7 +78,8 @@ test('formatChunk: rejects non-object chunk', t => {
 
 test('formatChunk: rejects bytes that are not a Uint8Array', t => {
     t.throws(
-        () => formatChunk(/** @type {any} */ ({ session: 'abcd12', index: 0, total: 1, bytes: [] })),
+        () =>
+            formatChunk(/** @type {any} */ ({ session: 'abcd12', index: 0, total: 1, bytes: [] })),
         { message: /must be a Uint8Array/ }
     );
 });
@@ -158,4 +163,64 @@ test('parseChunk: rejects line whose session starts with a digit', t => {
     t.throws(() => parseChunk('1aaaaa' + '000' + '001' + '00' + '0000'), {
         message: /lowercase letter/,
     });
+});
+
+// ── Config normalization ───────────────────────────────────────────────────
+
+test('formatChunk / parseChunk: accept a partial ChunkConfig', t => {
+    const line = formatChunk(
+        { session: 'aaaaaaaa', index: 0, total: 1, bytes: new Uint8Array([1]) },
+        { sessionLength: 8 }
+    );
+    t.is(parseChunk(line, { sessionLength: 8 }).session, 'aaaaaaaa');
+});
+
+test('formatChunk: re-resolves a stale ResolvedConfig spread', t => {
+    const stale = { ...DEFAULT_CONFIG, sessionLength: 8 };
+    const line = formatChunk(
+        { session: 'aaaaaaaa', index: 0, total: 1, bytes: new Uint8Array([1]) },
+        stale
+    );
+    // metaLength 20 + one payload char for byte 0x01
+    t.is(line.length, 21);
+});
+
+test('formatChunk: null config falls back to DEFAULT_CONFIG', t => {
+    const line = formatChunk(
+        { session: 'abcd12', index: 0, total: 1, bytes: new Uint8Array([1]) },
+        /** @type {any} */ (null)
+    );
+    t.is(line.slice(0, 6), 'abcd12');
+});
+
+test('parseChunk: rejects non-object config', t => {
+    const line = formatChunk({
+        session: 'abcd12',
+        index: 0,
+        total: 1,
+        bytes: new Uint8Array([1]),
+    });
+    t.throws(() => parseChunk(line, /** @type {any} */ (42)), { instanceOf: TypeError });
+});
+
+test('validateSessionId: accepts a partial ChunkConfig', t => {
+    t.notThrows(() => validateSessionId('aaaaaaaa', { sessionLength: 8 }));
+});
+
+test('formatChunk / parseChunk: accept a resolved-config literal', t => {
+    const cfg = { ...DEFAULT_CONFIG, sessionLength: 8 };
+    const line = formatChunk(
+        { session: 'aaaaaaaa', index: 0, total: 1, bytes: new Uint8Array([1]) },
+        cfg
+    );
+    t.is(parseChunk(line, cfg).session, 'aaaaaaaa');
+});
+
+test('chunksFromLines: accepts a resolved-config literal', t => {
+    const cfg = { ...DEFAULT_CONFIG, sessionLength: 8 };
+    const line = formatChunk(
+        { session: 'aaaaaaaa', index: 0, total: 1, bytes: new Uint8Array([1]) },
+        cfg
+    );
+    t.is(chunksFromLines([line], cfg).length, 1);
 });

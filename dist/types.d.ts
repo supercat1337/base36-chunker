@@ -45,7 +45,7 @@ export declare interface AnalysisResult {
     ok: boolean;
     /** Per-session analyses, sorted by `sessionId`. */
     sessions: SessionAnalysis[];
-    /** Lines whose session id could not be recovered at all. */
+    /** Lines whose session id could not be recovered at all, sorted by `line`. */
     malformed: ChunkIssue[];
 }
 
@@ -58,8 +58,8 @@ export declare interface AnalysisResult {
  * object that produced `chunks[i]`. `malformed` and `errors` entries carry
  * the offending item as `.item`.
  *
- * Never throws on bad data. Only a non-array `items` or a non-function
- * `getLine` raises `TypeError`.
+ * Never throws on bad data. Only a non-array `items`, a non-function
+ * `getLine`, or an invalid `config` raises.
  *
  * @example
  *   const rows = await db.select("SELECT id, chunk FROM chunks");
@@ -77,20 +77,42 @@ export declare interface AnalysisResult {
  * @param {T[]} items
  * @param {import("./types.js").AnalyzeItemsOptions<T>} options
  * @returns {import("./types.js").ItemizedAnalysisResult<T>}
- * @throws {TypeError} If `items` is not an array or `getLine` is not a function.
+ * @throws {TypeError} If `items` is not an array, `getLine` is not a
+ *                     function, or a config/option field is unknown.
+ * @throws {RangeError} If `config` fields are out of range.
  */
 export declare function analyzeItems<T>(items: T[], options: AnalyzeItemsOptions<T>): ItemizedAnalysisResult<T>;
 
 /**
  * Options for {@link analyzeItems}.
+ *
+ * `getLine` is required — there is no sensible default, so a TypeScript
+ * caller cannot write a call that is guaranteed to throw. The wire format
+ * comes from `config`, or from the bare `sessionLength` / `checksum` fields
+ * as a shorthand; the two forms are mutually exclusive and unknown keys
+ * raise a `TypeError`.
+ *
  * @public
  */
-export declare interface AnalyzeItemsOptions<T> {
+export declare type AnalyzeItemsOptions<T> = {
     /** Extract the base36 line from an item. */
     getLine: (item: T, index: number) => string;
-    /** Optional wire-format override; must match the encoder. */
-    config?: ChunkConfig;
-}
+    /** Wire-format override; must match the encoder. */
+    config?: ChunkConfig | ResolvedConfig;
+    /** Mutually exclusive with `config` — enforced by `ensureOptionsConfig`. */
+    sessionLength?: never;
+    /** Mutually exclusive with `config` — enforced by `ensureOptionsConfig`. */
+    checksum?: never;
+} | {
+    /** Extract the base36 line from an item. */
+    getLine: (item: T, index: number) => string;
+    /** Mutually exclusive with the bare fields — enforced by `ensureOptionsConfig`. */
+    config?: never;
+    /** Shorthand for `config.sessionLength`. */
+    sessionLength?: 4 | 5 | 6 | 7 | 8;
+    /** Shorthand for `config.checksum`. */
+    checksum?: 'none' | 'crc8' | 'crc16';
+};
 
 /**
  * Analyze an array of encoded lines, grouping by session and reporting
@@ -98,26 +120,21 @@ export declare interface AnalyzeItemsOptions<T> {
  *
  * Never throws on malformed input: bad lines, missing chunks, duplicates,
  * total mismatches, and checksum failures are surfaced in the returned
- * report. Only a non-array `lines` argument raises `TypeError`.
+ * report. Only a non-array `lines` argument — or an invalid `options` /
+ * `config` — raises.
  *
  * @public
  * @param {string[]} lines
- * @param {import("./types.js").AnalyzeOptions} [options]
+ * @param {import("./types.js").ConfigOptions} [options]
+ *        Either `{ config: {...} }`, or a config passed directly. Both forms
+ *        resolve to the same wire format; an unknown option key is a
+ *        `TypeError` rather than a silent fallback to the defaults.
  * @returns {import("./types.js").AnalysisResult}
- * @throws {TypeError} If `lines` is not an array.
+ * @throws {TypeError} If `lines` is not an array, `options` is not an object,
+ *                     or an option/config field is unknown.
+ * @throws {RangeError} If `config` fields are out of range.
  */
-export declare function analyzeLines(lines: string[], options?: AnalyzeOptions): AnalysisResult;
-
-/**
- * Options for {@link analyzeLines}.
- * @public
- */
-export declare interface AnalyzeOptions {
-    /**
-     * Must match the config used to encode the lines.
-     */
-    config?: ChunkConfig;
-}
+export declare function analyzeLines(lines: string[], options?: ConfigOptions): AnalysisResult;
 
 /**
  * Logical chunk of a payload. Carries everything needed to serialize it to
@@ -146,6 +163,10 @@ export declare interface Chunk {
     /**
      * Payload bytes for this chunk (UTF-8 for text). The number of bytes is
      * `bytes.length`; it is written into the count field of the encoded line.
+     *
+     * Leading zero bytes are preserved by the header, not by the payload:
+     * `formatChunk` writes only the significant base36 digits, and
+     * `parseChunk` restores exactly `bytes.length` bytes using `count`.
      */
     bytes: Uint8Array;
 }
@@ -162,23 +183,39 @@ export declare interface ChunkConfig {
      * letter (`a-z`); the remaining characters are drawn from the full
      * base36 alphabet.
      *
-     * Larger = safer against cross-session collisions; smaller = more payload
-     * per line. Approximate birthday-collision thresholds:
+     * The id space is `26 × 36^(sessionLength − 1)`. The figures below are
+     * **birthday thresholds** — the number of concurrent sessions at which
+     * the probability of at least one collision reaches ~50%. They are not
+     * "safe" limits: keep the live session count an order of magnitude below
+     * the threshold for a low collision risk.
      *
-     * - `6` → ~47 K concurrent sessions
-     * - `7` → ~280 K concurrent sessions
-     * - `8` → ~1.7 M concurrent sessions
+     * - `6` → ~47 K sessions (1.57 × 10⁹ ids)
+     * - `7` → ~280 K sessions (5.66 × 10¹⁰ ids)
+     * - `8` → ~1.7 M sessions (2.04 × 10¹² ids)
+     *
+     * A collision is not silent data loss: two payloads that share a session
+     * id surface in `analyzeLines` as one session with duplicate indices
+     * and/or a total mismatch, so `complete` stays `false` instead of two
+     * documents being concatenated.
      *
      * @defaultValue 6
      */
     sessionLength?: 4 | 5 | 6 | 7 | 8;
     /**
-     * Checksum algorithm applied to each chunk's payload.
+     * Checksum algorithm applied to each chunk's **payload bytes**.
      *
      * - `"none"`  — no checksum (0 header chars)
      * - `"crc8"`  — CRC-8/MAXIM (2 header chars)
      * - `"crc16"` — CRC-16/CCITT (4 header chars; a 16-bit value does not
      *   fit into 3 base36 digits, since `36³ = 46 656 < 65 536`)
+     *
+     * The checksum covers the payload and nothing else. `index`, `total`,
+     * and `count` are validated structurally instead: `total` must be ≥ 1
+     * and agree across the session, `index` must be `< total`, and the
+     * payload must occupy exactly `count` bytes in canonical form. A
+     * corrupted header field therefore appears as a structural
+     * inconsistency (duplicate or missing index, total mismatch) rather
+     * than as a checksum failure.
      *
      * @defaultValue "crc16"
      */
@@ -202,12 +239,16 @@ export declare interface ChunkIssue {
 /**
  * Parse lines into chunks. Throws on the first malformed line.
  *
+ * An empty array is **not** a valid encoding: `splitText('')` yields one
+ * zero-byte chunk, so zero lines mean "nothing arrived", not "empty text".
+ *
  * @public
  * @param {string[]} lines
- * @param {import("./types.js").ResolvedConfig} [config]
+ * @param {import("./types.js").ChunkConfig | import("./types.js").ResolvedConfig} [config]
  * @returns {import("./types.js").Chunk[]}
+ * @throws {TypeError} If `lines` is not a non-empty array.
  */
-export declare function chunksFromLines(lines: string[], config?: ResolvedConfig): Chunk[];
+export declare function chunksFromLines(lines: string[], config?: ChunkConfig | ResolvedConfig): Chunk[];
 
 /**
  * Self-consistent bundle returned by {@link createCodec}. Every method on
@@ -218,15 +259,17 @@ export declare function chunksFromLines(lines: string[], config?: ResolvedConfig
  */
 export declare interface Codec {
     /** Resolved config shared by all methods. */
-    config: ResolvedConfig;
+    config: Readonly<ResolvedConfig>;
     /** Shortcut for `config.metaLength`. */
-    metaLen: number;
+    metaLength: number;
     /** Split text into base36-only lines. */
     encodeText: (text: string, options?: Omit<EncodeOptions, 'config'>) => string[];
     /** Reassemble text from base36-only lines. Throws on any inconsistency. */
     decodeText: (lines: string[]) => string;
     /** Split text into {@link Chunk} structures. */
     splitText: (text: string, options?: Omit<EncodeOptions, 'config'>) => Chunk[];
+    /** Concatenate payload bytes of a complete session — no UTF-8 decoding. */
+    joinBytes: (chunks: Chunk[]) => Uint8Array;
     /** Reassemble text from {@link Chunk} structures. */
     joinChunks: (chunks: Chunk[]) => string;
     /** Parse a single line into a {@link Chunk}. */
@@ -239,7 +282,7 @@ export declare interface Codec {
     analyzeLines: (lines: string[]) => AnalysisResult;
     /** Non-throwing integrity analysis over arbitrary items; `config` is
      *  supplied by the codec, so it cannot diverge from encode/decode. */
-    analyzeItems: <T>(items: T[], options: Omit<AnalyzeItemsOptions<T>, 'config'>) => ItemizedAnalysisResult<T>;
+    analyzeItems: <T>(items: T[], options: Omit<AnalyzeItemsOptions<T>, 'config' | 'sessionLength' | 'checksum'>) => ItemizedAnalysisResult<T>;
     /** Filter the report down to complete sessions. */
     completeSessions: (report: AnalysisResult) => SessionAnalysis[];
     /** Filter the report down to incomplete sessions. */
@@ -258,6 +301,27 @@ export declare interface Codec {
 export declare function completeSessions(report: AnalysisResult): SessionAnalysis[];
 
 /**
+ * Options for {@link analyzeLines} and {@link decodeText}.
+ *
+ * All three shapes resolve to the same wire format:
+ *
+ * - `{ config: { sessionLength: 8 } }` — explicit nested override;
+ * - `{ config: resolvedConfig }`        — a config from {@link resolveConfig};
+ * - `{ sessionLength: 8 }`, or a resolved config passed directly — the
+ *   config in the options slot itself.
+ *
+ * `{ config: … }` and the bare fields are mutually exclusive; passing both
+ * is a `TypeError`. Unknown keys raise as well: a misspelled option would
+ * otherwise fall back to `DEFAULT_CONFIG` and silently make every line of a
+ * different layout look `malformed`.
+ *
+ * @public
+ */
+export declare type ConfigOptions = {
+    config?: ChunkConfig | ResolvedConfig;
+} | ChunkConfig | ResolvedConfig;
+
+/**
  * Create a self-consistent codec: every method on the returned object uses
  * the same resolved config for encoding and decoding, so mismatched-config
  * bugs are impossible by construction.
@@ -269,32 +333,25 @@ export declare function completeSessions(report: AnalysisResult): SessionAnalysi
 export declare function createCodec(config?: ChunkConfig): Codec;
 
 /**
- * Options for {@link decodeText}.
- * @public
- */
-export declare interface DecodeOptions {
-    /**
-     * Must match the config used to encode the lines, otherwise the checksum
-     * or the header parse fails.
-     */
-    config?: ChunkConfig;
-}
-
-/**
  * Decode encoded lines back to the original text.
  *
  * @public
  * @param {string[]} lines
- * @param {import("./types.js").DecodeOptions} [options]
+ * @param {import("./types.js").ConfigOptions} [options]
+ *        Either `{ config: {...} }` or a config passed directly.
  * @returns {string}
+ * @throws {TypeError | RangeError} On argument or config errors.
  */
-export declare function decodeText(lines: string[], options?: DecodeOptions): string;
+export declare function decodeText(lines: string[], options?: ConfigOptions): string;
 
 /**
- * Default configuration: 6-char session, CRC16, 18-char header.
+ * Default configuration. Frozen: mutating it would silently poison every
+ * `resolveConfig()` call in the process.
+ *
  * @public
+ * @type {Readonly<import('./types.js').ResolvedConfig>}
  */
-export declare const DEFAULT_CONFIG: ResolvedConfig;
+export declare const DEFAULT_CONFIG: Readonly<ResolvedConfig>;
 
 /**
  * Options for {@link splitText} and {@link encodeText}.
@@ -324,18 +381,21 @@ export declare interface EncodeOptions {
     sessionId?: string;
     /**
      * Override the default wire format. Omitted fields inherit defaults.
+     * A `ResolvedConfig` from {@link resolveConfig} is accepted as well and
+     * used unchanged (re-resolved only if it is internally inconsistent).
      */
-    config?: ChunkConfig;
+    config?: ChunkConfig | ResolvedConfig;
 }
 
 /**
  * Split text into an array of base36-only lines.
- * Convenience wrapper around `splitText(...).map(formatChunk)`.
+ * Convenience wrapper around `splitText(...).map(c => formatChunk(c, config))`.
  *
  * @public
  * @param {string} text
  * @param {import("./types.js").EncodeOptions} [options]
  * @returns {string[]}
+ * @throws {TypeError | RangeError}
  */
 export declare function encodeText(text: string, options?: EncodeOptions): string[];
 
@@ -345,11 +405,11 @@ export declare function encodeText(text: string, options?: EncodeOptions): strin
  *
  * @public
  * @param {import("./types.js").Chunk} chunk
- * @param {import("./types.js").ResolvedConfig} [config]
+ * @param {import("./types.js").ChunkConfig | import("./types.js").ResolvedConfig} [config]
  * @returns {string}
  * @throws {TypeError | RangeError}
  */
-export declare function formatChunk(chunk: Chunk, config?: ResolvedConfig): string;
+export declare function formatChunk(chunk: Chunk, config?: ChunkConfig | ResolvedConfig): string;
 
 /**
  * Generate a fresh base36 session id of `config.sessionLength` characters.
@@ -359,10 +419,11 @@ export declare function formatChunk(chunk: Chunk, config?: ResolvedConfig): stri
  * the full base36 alphabet.
  *
  * @public
- * @param {import("./types.js").ResolvedConfig} [config]
+ * @param {import("./types.js").ChunkConfig | import("./types.js").ResolvedConfig} [config]
  * @returns {string}
+ * @throws {RangeError} If `config` fields are out of range.
  */
-export declare function generateSessionId(config?: ResolvedConfig): string;
+export declare function generateSessionId(config?: ChunkConfig | ResolvedConfig): string;
 
 /**
  * Filter the report down to incomplete sessions.
@@ -415,12 +476,33 @@ export declare interface ItemizedSessionAnalysis<T> extends SessionAnalysis {
 }
 
 /**
+ * Concatenate the payload bytes of a complete session.
+ *
+ * Performs the same session validation as {@link joinChunks} but returns
+ * raw bytes — no UTF-8 decoding, so arbitrary binary payloads (ciphertext,
+ * compressed blobs, protobuf, images) survive intact.
+ *
+ * @public
+ * @param {import("./types.js").Chunk[]} chunks
+ * @returns {Uint8Array}
+ * @throws {TypeError} If the input is not a non-empty array of chunks.
+ * @throws {Error} If the chunks do not form one complete session.
+ */
+export declare function joinBytes(chunks: Chunk[]): Uint8Array;
+
+/**
  * Reassemble the original text from an unordered array of chunks.
+ *
+ * Validates the session exactly like {@link joinBytes}, then decodes the
+ * concatenated bytes as **strict** UTF-8: invalid bytes throw instead of
+ * silently producing U+FFFD. For binary payloads use {@link joinBytes}.
  *
  * @public
  * @param {import("./types.js").Chunk[]} chunks
  * @returns {string}
- * @throws {TypeError | Error}
+ * @throws {TypeError} If the input is not a non-empty array of chunks, or
+ *                     the concatenated bytes are not valid UTF-8.
+ * @throws {Error} If the chunks do not form one complete session.
  */
 export declare function joinChunks(chunks: Chunk[]): string;
 
@@ -432,16 +514,26 @@ export declare function joinChunks(chunks: Chunk[]): string;
 export declare const LETTERS: "abcdefghijklmnopqrstuvwxyz";
 
 /**
- * Parse one encoded line into a chunk. Validates the checksum according to
- * `config.checksum` and throws on mismatch.
+ * Parse one encoded line into a chunk. Validates the payload encoding and,
+ * when configured, the checksum.
+ *
+ * Two independent guards apply to the payload:
+ *
+ * 1. **Canonical form.** `bytesToBase36` drops leading zero bytes, so a
+ *    canonical payload is the shortest base36 form of its value. Accepting
+ *    `'000a'` and `'a'` as the same chunk would break deduplication,
+ *    idempotent re-sends, and any signature computed over the line.
+ * 2. **Checksum.** `crc8`/`crc16` cover the payload bytes — and only them.
+ *    `index`, `total`, and `count` are protected structurally (they must be
+ *    self-consistent) but not by the CRC.
  *
  * @public
  * @param {string} line
- * @param {import("./types.js").ResolvedConfig} [config]
+ * @param {import("./types.js").ChunkConfig | import("./types.js").ResolvedConfig} [config]
  * @returns {import("./types.js").Chunk}
  * @throws {TypeError | Error}
  */
-export declare function parseChunk(line: string, config?: ResolvedConfig): Chunk;
+export declare function parseChunk(line: string, config?: ChunkConfig | ResolvedConfig): Chunk;
 
 /**
  * Resolve a possibly-partial config into a frozen, fully-specified one.
@@ -450,10 +542,11 @@ export declare function parseChunk(line: string, config?: ResolvedConfig): Chunk
  *
  * @public
  * @param {import("./types.js").ChunkConfig} [partial]
- * @returns {import("./types.js").ResolvedConfig}
- * @throws {RangeError} If `sessionLength` or `checksum` are out of range.
+ * @returns {Readonly<import("./types.js").ResolvedConfig>}
+ * @throws {TypeError} If `partial` is not an object or has an unknown field.
+ * @throws {RangeError} If a field is out of range.
  */
-export declare function resolveConfig(partial?: ChunkConfig): ResolvedConfig;
+export declare function resolveConfig(partial?: ChunkConfig): Readonly<ResolvedConfig>;
 
 /**
  * Fully-resolved configuration with derived fields pre-computed. Produced
@@ -504,7 +597,10 @@ export declare interface SessionAnalysis {
     complete: boolean;
     /** Best-guess chunk count, or `null` if chunks disagree or none parsed. */
     expectedTotal: number | null;
-    /** `true` if chunks disagree on `total`, or nothing could be parsed. */
+    /**
+     * `true` if chunks disagree on `total`, or if no chunk could be parsed
+     * (so `expectedTotal` is `null`).
+     */
     totalMismatch: boolean;
     /** Successfully decoded chunks, sorted by `index`. */
     chunks: Chunk[];
@@ -514,18 +610,28 @@ export declare interface SessionAnalysis {
     missing: number[];
     /** Indices that appear more than once. */
     duplicates: number[];
-    /** Lines whose session was recovered but whose payload failed to parse. */
+    /**
+     * Lines whose session was recovered but whose payload failed to parse,
+     *  sorted by `line`.
+     */
     errors: ChunkIssue[];
 }
 
 /**
  * Split plain text into an array of chunk structures.
  *
+ * Chunks never break a UTF-8 character: each chunk's `bytes` decodes to
+ * valid UTF-8 on its own, so a partial session can be displayed without
+ * replacement characters.
+ *
  * @public
  * @param {string} text
  * @param {import("./types.js").EncodeOptions} [options]
  * @returns {import("./types.js").Chunk[]}
- * @throws {TypeError | RangeError}
+ * @throws {TypeError} If `text` is not a string, contains an unpaired
+ *                     surrogate, or `options` has an unknown key.
+ * @throws {RangeError} If `maxLen`/`bytesPerChunk` are out of range or a
+ *                      character does not fit.
  */
 export declare function splitText(text: string, options?: EncodeOptions): Chunk[];
 

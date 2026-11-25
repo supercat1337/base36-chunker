@@ -18,18 +18,20 @@ export interface AnalysisResult {
 export function analyzeItems<T>(items: T[], options: AnalyzeItemsOptions<T>): ItemizedAnalysisResult<T>;
 
 // @public
-export interface AnalyzeItemsOptions<T> {
-    config?: ChunkConfig;
+export type AnalyzeItemsOptions<T> = {
     getLine: (item: T, index: number) => string;
-}
+    config?: ChunkConfig | ResolvedConfig;
+    sessionLength?: never;
+    checksum?: never;
+} | {
+    getLine: (item: T, index: number) => string;
+    config?: never;
+    sessionLength?: 4 | 5 | 6 | 7 | 8;
+    checksum?: 'none' | 'crc8' | 'crc16';
+};
 
 // @public
-export function analyzeLines(lines: string[], options?: AnalyzeOptions): AnalysisResult;
-
-// @public
-export interface AnalyzeOptions {
-    config?: ChunkConfig;
-}
+export function analyzeLines(lines: string[], options?: ConfigOptions): AnalysisResult;
 
 // @public
 export interface Chunk {
@@ -52,22 +54,23 @@ export interface ChunkIssue {
 }
 
 // @public
-export function chunksFromLines(lines: string[], config?: ResolvedConfig): Chunk[];
+export function chunksFromLines(lines: string[], config?: ChunkConfig | ResolvedConfig): Chunk[];
 
 // @public
 export interface Codec {
-    analyzeItems: <T>(items: T[], options: Omit<AnalyzeItemsOptions<T>, 'config'>) => ItemizedAnalysisResult<T>;
+    analyzeItems: <T>(items: T[], options: Omit<AnalyzeItemsOptions<T>, 'config' | 'sessionLength' | 'checksum'>) => ItemizedAnalysisResult<T>;
     analyzeLines: (lines: string[]) => AnalysisResult;
     chunksFromLines: (lines: string[]) => Chunk[];
     completeSessions: (report: AnalysisResult) => SessionAnalysis[];
-    config: ResolvedConfig;
+    config: Readonly<ResolvedConfig>;
     decodeText: (lines: string[]) => string;
     encodeText: (text: string, options?: Omit<EncodeOptions, 'config'>) => string[];
     formatChunk: (chunk: Chunk) => string;
     generateSessionId: () => string;
     incompleteSessions: (report: AnalysisResult) => SessionAnalysis[];
+    joinBytes: (chunks: Chunk[]) => Uint8Array;
     joinChunks: (chunks: Chunk[]) => string;
-    metaLen: number;
+    metaLength: number;
     parseChunk: (line: string) => Chunk;
     splitText: (text: string, options?: Omit<EncodeOptions, 'config'>) => Chunk[];
 }
@@ -76,23 +79,23 @@ export interface Codec {
 export function completeSessions(report: AnalysisResult): SessionAnalysis[];
 
 // @public
+export type ConfigOptions = {
+    config?: ChunkConfig | ResolvedConfig;
+} | ChunkConfig | ResolvedConfig;
+
+// @public
 export function createCodec(config?: ChunkConfig): Codec;
 
 // @public
-export interface DecodeOptions {
-    config?: ChunkConfig;
-}
+export function decodeText(lines: string[], options?: ConfigOptions): string;
 
 // @public
-export function decodeText(lines: string[], options?: DecodeOptions): string;
-
-// @public
-export const DEFAULT_CONFIG: ResolvedConfig;
+export const DEFAULT_CONFIG: Readonly<ResolvedConfig>;
 
 // @public
 export interface EncodeOptions {
     bytesPerChunk?: number;
-    config?: ChunkConfig;
+    config?: ChunkConfig | ResolvedConfig;
     maxLen?: number;
     sessionId?: string;
 }
@@ -101,10 +104,10 @@ export interface EncodeOptions {
 export function encodeText(text: string, options?: EncodeOptions): string[];
 
 // @public
-export function formatChunk(chunk: Chunk, config?: ResolvedConfig): string;
+export function formatChunk(chunk: Chunk, config?: ChunkConfig | ResolvedConfig): string;
 
 // @public
-export function generateSessionId(config?: ResolvedConfig): string;
+export function generateSessionId(config?: ChunkConfig | ResolvedConfig): string;
 
 // @public
 export function incompleteSessions(report: AnalysisResult): SessionAnalysis[];
@@ -127,16 +130,19 @@ export interface ItemizedSessionAnalysis<T> extends SessionAnalysis {
 }
 
 // @public
+export function joinBytes(chunks: Chunk[]): Uint8Array;
+
+// @public
 export function joinChunks(chunks: Chunk[]): string;
 
 // @public
 export const LETTERS: "abcdefghijklmnopqrstuvwxyz";
 
 // @public
-export function parseChunk(line: string, config?: ResolvedConfig): Chunk;
+export function parseChunk(line: string, config?: ChunkConfig | ResolvedConfig): Chunk;
 
 // @public
-export function resolveConfig(partial?: ChunkConfig): ResolvedConfig;
+export function resolveConfig(partial?: ChunkConfig): Readonly<ResolvedConfig>;
 
 // @public
 export interface ResolvedConfig {

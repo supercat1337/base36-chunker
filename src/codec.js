@@ -2,7 +2,7 @@
 
 import { resolveConfig } from './config.js';
 import { formatChunk, parseChunk } from './chunk.js';
-import { chunksFromLines, decodeText, joinChunks } from './decode.js';
+import { chunksFromLines, decodeText, joinBytes, joinChunks } from './decode.js';
 import { encodeText, generateSessionId, splitText } from './encode.js';
 import { analyzeItems, analyzeLines, completeSessions, incompleteSessions } from './analyze.js';
 
@@ -17,12 +17,14 @@ import { analyzeItems, analyzeLines, completeSessions, incompleteSessions } from
  */
 export function createCodec(config = {}) {
     const resolved = resolveConfig(config);
+    const frozen = resolved;
     return {
-        config: resolved,
-        metaLen: resolved.metaLength,
+        config: frozen,
+        metaLength: frozen.metaLength,
         encodeText: (text, options = {}) => encodeText(text, { ...options, config: resolved }),
         decodeText: lines => decodeText(lines, { config: resolved }),
         splitText: (text, options = {}) => splitText(text, { ...options, config: resolved }),
+        joinBytes,
         joinChunks,
         parseChunk: line => parseChunk(line, resolved),
         formatChunk: chunk => formatChunk(chunk, resolved),

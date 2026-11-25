@@ -13,7 +13,10 @@
 npm install @supercat1337/base36-chunker
 ```
 
-Requires Node.js ≥ 19 (for `globalThis.crypto.getRandomValues`) or any modern browser / edge runtime.
+Requires Node.js ≥ 19 (for `globalThis.crypto.getRandomValues`) or any modern browser / edge runtime. The requirement is declared in `package.json` → `engines`.
+
+The package is **ESM-only**: `exports` exposes a single `import` condition, so
+CommonJS cannot resolve it. From a CJS file use `await import('@supercat1337/base36-chunker')`.
 
 ## Quick start
 
@@ -24,10 +27,14 @@ import { generateSessionId, splitText, formatChunk } from '@supercat1337/base36-
 
 const sessionId = generateSessionId(); // 'a3k9m2' — 6 chars by default
 const chunks = splitText(text, { sessionId, maxLen: 63 });
-const lines = chunks.map(formatChunk); // ['a3k9m2000...', ...]
+const lines = chunks.map(chunk => formatChunk(chunk)); // ['a3k9m2000...', ...]
 
 await sendToServer(lines);
 ```
+
+> `formatChunk` takes an optional second argument (the config), so **do not** write
+> `chunks.map(formatChunk)`: `Array.prototype.map` passes the index as the second
+> argument, and the index is not a config. Always use an arrow function.
 
 **Server side** — analyze what arrived, then reassemble complete sessions:
 
@@ -35,7 +42,7 @@ await sendToServer(lines);
 import { analyzeLines, joinChunks } from '@supercat1337/base36-chunker';
 
 const lines = await loadLinesFromQueue();
-const report = analyzeLines(lines); // never throws
+const report = analyzeLines(lines); // never throws on bad data
 
 for (const session of report.sessions) {
     if (session.complete) {
@@ -104,15 +111,15 @@ This is the key difference from plain `text.match(/.{1,63}/g)` + `btoa`:
 | `count`   | Restore leading zero bytes that bigint encoding drops.                                                        |
 | `crc`     | Reject content corruption inside the payload — see "Checksum choice".                                         |
 
-And `analyzeLines` / `analyzeItems` **never throw** — critical for a server: partial data can be persisted and the missing chunks re-requested, instead of replying to the client with a "500 Internal Server Error".
+And `analyzeLines` / `analyzeItems` **never throw** on bad data — critical for a server: partial data can be persisted and the missing chunks re-requested, instead of replying to the client with a "500 Internal Server Error".
 
 ### When this package is **not** the right tool
 
 - **One chunk, reliable channel.** If the text always fits in one line and travels over HTTP/TCP, a plain `TextEncoder` + `btoa` is enough. The metadata is overhead.
 - **The channel already chunks and verifies integrity.** HTTP with `Content-Length`, TCP, gRPC streams — order and control are already there.
-- **You need cryptography.** This is **only** encoding, splitting, and a checksum. Encrypt/sign before or after; the package is neutral. `Chunk.bytes` accepts arbitrary bytes, so AES-GCM ciphertext works fine — but the encryption itself is not provided.
-- **Gigabyte-scale payloads.** The default layout targets ~1.35 MB per session. For more, either raise `maxLen` (payload per chunk grows linearly) or widen the `total` field in `src/config.js` from 3 chars to 4 (36⁴ ≈ 1.68 M chunks, ~47 MB per session, at the cost of one payload byte per line). The README does not cover the latter — read `LAYOUT` in `src/config.js` before changing it.
-- **Binary data as the primary case.** The API accepts and returns bytes (`Chunk.bytes`), but the high-level `splitText` / `joinChunks` operate on UTF-8 strings. For a stream of arbitrary bytes it is usually simpler to work with `Chunk[]` and `formatChunk` directly — and if that is your main case, consider a dedicated package.
+- **You need cryptography.** This is **only** encoding, splitting, and a checksum. Encrypt/sign before or after; the package is neutral. `Chunk.bytes` accepts arbitrary bytes, so AES-GCM ciphertext survives `formatChunk` / `parseChunk` — but the encryption itself is not provided, and `joinChunks` decodes as UTF-8 (see "Binary data as the primary case" below).
+- **Gigabyte-scale payloads.** The default layout is sized for payloads of a few megabytes per session. For more, either raise `maxLen` (payload per chunk grows linearly) or widen `LAYOUT` in `src/config.js` — widening the index and total fields together, from 3 to 4 chars each, raises the chunk ceiling from 36³ − 1 to 36⁴ − 1 and, at `maxLen = 63`, gives roughly 45 MB per session, at the cost of about one payload byte per line. Widening the header is a **wire-format change**, not a config option: encoder and decoder must share the same `LAYOUT`, so old and new lines are not mutually compatible.
+- **Binary data as the primary case.** The low-level API is fully binary-safe: `formatChunk` / `parseChunk` round-trip `Uint8Array` byte-for-byte, and `joinBytes(chunks)` returns the concatenated `Uint8Array` without decoding. The text helpers are the narrow part: `splitText` takes a `string` (UTF-8-safe splitting) and `joinChunks` decodes with `{ fatal: true }`. If your payload is binary, use `Chunk[]` + `formatChunk` / `parseChunk` / `joinBytes` — and if that is your main case, consider a dedicated package.
 
 ### TL;DR
 
@@ -144,18 +151,47 @@ The package exposes three top-level flows, so client and server code import exac
 ```
 
 - **`encode.js`** — text → `Chunk[]` → `string[]`. Runs where the text is produced.
-- **`decode.js`** — `string[]` → `Chunk[]` → text. Throws on any inconsistency; meant for the "I know this is one complete session" case.
-- **`analyze.js`** — `string[]` (or arbitrary items via `analyzeItems`) → `AnalysisResult` / `ItemizedAnalysisResult<T>`. **Never throws**; groups lines by session and reports completeness, missing indices, duplicates, and per-line errors.
+  Splitting is UTF-8-safe: each chunk's bytes decode to valid UTF-8 on their own.
+- **`decode.js`** — `string[]` → `Chunk[]` → text / bytes. Throws on any inconsistency; meant for the "I know this is one complete session" case. `joinChunks` decodes as strict UTF-8 (`{ fatal: true }`); `joinBytes` returns the raw `Uint8Array` for binary payloads.
+- **`analyze.js`** — `string[]` (or arbitrary items via `analyzeItems`) → `AnalysisResult` / `ItemizedAnalysisResult<T>`. **Never throws** on bad data; groups lines by session and reports completeness, missing indices, duplicates, and per-line errors.
 
-Supporting modules: `base36.js` (alphabet primitives), `config.js` (layout and checksum resolution), `crc.js` (CRC8 / CRC16), `chunk.js` (line format), `codec.js` (`createCodec` factory). The dependency graph is strict:
+Supporting modules: `base36.js` (alphabet primitives), `config.js` (layout, checksum resolution, config normalization), `crc.js` (CRC8 / CRC16), `chunk.js` (line format), `codec.js` (`createCodec` factory). The dependency graph is acyclic — as an adjacency list, so no edge is hidden:
 
 ```
-{base36, config, crc} ← chunk ← {encode, decode, analyze} ← codec ← index
+base36  → (leaf)
+config  → (leaf)
+crc     → (leaf)
+chunk   → base36, config, crc
+encode  → base36, config, chunk
+decode  → config, chunk
+analyze → config, chunk
+codec   → config, chunk, encode, decode, analyze
+index   → base36, config, chunk, encode, decode, analyze, codec
 ```
 
-`analyze.js` imports `parseChunk` and `SESSION_PREFIX_RE` from `chunk.js` — that is the same arrow, no cycle.
+`encode.js` reaches `base36.js` **directly** (`LETTERS`, `LOG2_BASE36`, `randomBase36`), not only through `chunk.js`; `codec.js` imports `resolveConfig` from `config.js`. Neither creates a cycle. `analyze.js` imports `parseChunk` and `SESSION_PREFIX_RE` from `chunk.js` — that is the same arrow as above, no cycle.
 
 ## API
+
+### Config normalization
+
+Every function that takes a wire-format config accepts the same three shapes, normalized by `ensureConfig`:
+
+```js
+parseChunk(line); // DEFAULT_CONFIG
+parseChunk(line, { checksum: 'crc8' }); // partial ChunkConfig
+parseChunk(line, resolveConfig({ checksum: 'crc8' })); // ResolvedConfig
+```
+
+Rules:
+
+- `null` / `undefined` → `DEFAULT_CONFIG`.
+- An object that _looks_ resolved but is inconsistent (`{ ...DEFAULT_CONFIG, sessionLength: 8 }`, where `metaLength` is still 18) is re-resolved.
+- A non-object config raises `TypeError('config must be an object')`.
+- **An unknown field raises `TypeError`.** There is no silent fallback: `{ sessionLen: 8 }` would otherwise encode and decode with different layouts while both calls report success. The same applies to mixing `{ config: … }` with bare fields.
+- Out-of-range fields raise `RangeError`.
+
+`createCodec` is the one exception to "`null` means defaults": it takes a `ChunkConfig`, goes straight to `resolveConfig`, and therefore raises `TypeError` on `createCodec(null)` — the same exception as `resolveConfig(null)`. A partial config, a resolved config, and no argument at all all work normally.
 
 ### Client: encode
 
@@ -176,13 +212,19 @@ const line = formatChunk(chunks[0]);
 
 // High-level shortcut: text → string[]
 const lines = encodeText('Hello, World!', { sessionId });
-// equivalent to: splitText(text, opts).map(formatChunk)
+// equivalent to: splitText(text, opts).map(c => formatChunk(c, config))
 ```
 
 ### Server: decode (throwing)
 
 ```js
-import { parseChunk, chunksFromLines, joinChunks, decodeText } from '@supercat1337/base36-chunker';
+import {
+    parseChunk,
+    chunksFromLines,
+    joinBytes,
+    joinChunks,
+    decodeText,
+} from '@supercat1337/base36-chunker';
 
 // Line → Chunk (individually)
 const chunk = parseChunk(line); // { session, index, total, bytes }
@@ -190,15 +232,35 @@ const chunk = parseChunk(line); // { session, index, total, bytes }
 // string[] → Chunk[] (throws on the first malformed line)
 const chunks = chunksFromLines(lines);
 
-// Chunk[] → text (throws on session/total mismatch, missing indices)
+// Chunk[] → Uint8Array (throws on session/total mismatch, duplicate or
+// missing indices). No UTF-8 decoding — safe for arbitrary binary payloads.
+const bytes = joinBytes(chunks);
+
+// Chunk[] → text (throws on session/total mismatch, duplicate or missing indices)
 const text = joinChunks(chunks);
+
+// joinChunks decodes as UTF-8 with `{ fatal: true }`: invalid bytes throw
+// instead of silently turning into U+FFFD. For binary payloads use
+// joinBytes(), which returns the raw Uint8Array.
 
 // Full shortcut: string[] → text
 const text2 = decodeText(lines);
+
+// Full shortcut: string[] → bytes
+const bytes2 = joinBytes(chunksFromLines(lines));
 ```
 
 `decodeText` and friends are "all or nothing". For any input that may be
 mixed or partial, use `analyzeLines` / `analyzeItems` instead.
+
+| Call                                                                       | Failure                                                                                    |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `chunksFromLines([])`, `decodeText([])`, `joinChunks([])`, `joinBytes([])` | `TypeError` — zero lines never encode anything: `splitText('')` yields one zero-byte chunk |
+| `parseChunk` on a short or oversized line                                  | `Error` — shorter than the header, or longer than any valid chunk                          |
+| `parseChunk` with a bad CRC                                                | `Error('Checksum mismatch: …')`                                                            |
+| `parseChunk` with a non-canonical payload                                  | `Error('Non-canonical payload: …')`                                                        |
+| `joinChunks` / `joinBytes` on an incomplete set                            | `Error` — session/total mismatch, duplicate, or missing index                              |
+| `joinChunks` on invalid UTF-8                                              | `TypeError` from `TextDecoder({ fatal: true })`                                            |
 
 ### Server: analyze plain lines (non-throwing)
 
@@ -209,7 +271,7 @@ const report = analyzeLines(lines);
 
 report.ok; // true if every session is complete & no malformed lines
 report.sessions; // SessionAnalysis[], sorted by sessionId
-report.malformed; // ChunkIssue[] — lines with no recoverable session id
+report.malformed; // ChunkIssue[] — lines with no recoverable session id, sorted by line
 
 // Convenience filters:
 for (const s of completeSessions(report)) {
@@ -223,6 +285,9 @@ for (const s of incompleteSessions(report)) {
 `analyzeLines` never throws on bad data — it returns a structured report.
 The `chunks` array is populated for every session, even incomplete ones, so
 partial payloads can be persisted to the database immediately.
+
+The only exceptions are argument errors: `TypeError` for a non-array `lines` or a
+non-object `config`, and `RangeError` for out-of-range config fields.
 
 ### Server: analyze arbitrary items (non-throwing)
 
@@ -262,11 +327,27 @@ If you already have a codec from `createCodec(...)`, use
 automatically, so you cannot accidentally analyze with a different layout
 than you encoded with.
 
+> **`ChunkIssue.line` is an index in the input array, not a line number.**
+>
+> For `analyzeLines` it is the position in the `lines[]` array you passed in.
+> For `analyzeItems` it is the position of the item in `items[]` — the chunk
+> text comes from your `getLine(item, index)` call, so treat `line` as
+> "which input element failed", never as a row number in a file or a database.
+>
+> The name is historical (kept for API stability) and does not imply anything
+> about newlines.
+
 ### Configuration utilities
 
 ```js
 // Configuration utilities
-import { createCodec, resolveConfig, DEFAULT_CONFIG } from '@supercat1337/base36-chunker';
+import {
+    createCodec,
+    resolveConfig,
+    DEFAULT_CONFIG,
+    ALPHABET,
+    LETTERS,
+} from '@supercat1337/base36-chunker';
 
 // Pre-built default: { sessionLength: 6, checksum: "crc16" }
 DEFAULT_CONFIG.metaLength; // 18
@@ -284,18 +365,34 @@ const rows = await db.select('SELECT id, chunk FROM chunks');
 const report = codec.analyzeItems(rows, { getLine: r => r.chunk });
 ```
 
+`codec.metaLength` is a shortcut for `codec.config.metaLength` (the name differs
+because `Codec` predates the `ResolvedConfig` interface; both are public).
+
 ### Session helpers
 
 ```js
-import { generateSessionId, LETTERS, DEFAULT_CONFIG } from '@supercat1337/base36-chunker';
+import {
+    generateSessionId,
+    resolveConfig,
+    LETTERS,
+    DEFAULT_CONFIG,
+} from '@supercat1337/base36-chunker';
 
 const sessionId = generateSessionId(); // 'a3k9m2' — 6 chars (default)
-const longer = generateSessionId({ ...DEFAULT_CONFIG, sessionLength: 8 });
+
+// To change the length, resolve the config first — do not spread DEFAULT_CONFIG:
+const cfg8 = resolveConfig({ sessionLength: 8 });
+const longer = generateSessionId(cfg8); // 8 chars
 
 // `LETTERS` is exported so consumers can validate or generate their own
 // session ids by the same rule.
 LETTERS; // 'abcdefghijklmnopqrstuvwxyz'
+ALPHABET; // '0123456789abcdefghijklmnopqrstuvwxyz'
 ```
+
+> ⚠️ `generateSessionId({ ...DEFAULT_CONFIG, sessionLength: 8 })` also works —
+> `ensureConfig` detects the stale `metaLength` and re-resolves — but
+> `resolveConfig({ sessionLength: 8 })` expresses the intent directly.
 
 Reading a session id from a line is trivial — it is `line.slice(0, config.sessionLength)` (6 by default). No dedicated helper is exposed; grouping is `analyzeLines`' job.
 
@@ -303,27 +400,46 @@ Reading a session id from a line is trivial — it is `line.slice(0, config.sess
 
 ### `splitText(text, options?)` / `encodeText(text, options?)`
 
-| Option          | Type          | Default          | Description                                                                                   |
-| --------------- | ------------- | ---------------- | --------------------------------------------------------------------------------------------- |
-| `maxLen`        | `number`      | `63`             | Maximum line length in base36 chars (metadata included).                                      |
-| `bytesPerChunk` | `number`      | auto             | Explicit chunk size in bytes; takes precedence over `maxLen`.                                 |
-| `sessionId`     | `string`      | random           | Fixed base36 session id. Must start with a lowercase letter; length = `config.sessionLength`. |
-| `config`        | `ChunkConfig` | `DEFAULT_CONFIG` | Override session length and checksum.                                                         |
+| Option          | Type                            | Default          | Description                                                                                   |
+| --------------- | ------------------------------- | ---------------- | --------------------------------------------------------------------------------------------- |
+| `maxLen`        | `number`                        | `63`             | Maximum line length in base36 chars (metadata included).                                      |
+| `bytesPerChunk` | `number`                        | auto             | Explicit chunk size in bytes; takes precedence over `maxLen`.                                 |
+| `sessionId`     | `string`                        | random           | Fixed base36 session id. Must start with a lowercase letter; length = `config.sessionLength`. |
+| `config`        | `ChunkConfig \| ResolvedConfig` | `DEFAULT_CONFIG` | Override session length and checksum.                                                         |
+
+> ⚠️ When `bytesPerChunk` is set, the resulting line length is **not** bounded
+> by `maxLen`. Keep `bytesPerChunk` small enough for your transport; the hard
+> upper bound is `config.maxByteCount` (1 295 bytes).
+
+> ⚠️ `splitText` never breaks a UTF-8 character: a chunk boundary is only
+> placed at a byte that is not a continuation byte. As a consequence, a chunk
+> may be shorter than `bytesPerChunk`, and `bytesPerChunk` must be at least
+> as large as the longest character in the text (1–4 bytes). If it is not,
+> `splitText` throws `RangeError` — raise `maxLen` or set `bytesPerChunk`
+> explicitly. `total` is the **actual** number of chunks, not
+> `ceil(byteLength / bytesPerChunk)`.
+
+> ⚠️ `splitText` rejects text containing an **unpaired surrogate**
+> (`'\uD800'` and friends) with a `TypeError` naming the index. `TextEncoder`
+> would silently replace it with U+FFFD, which would break the promise that
+> `decodeText(encodeText(text)) === text`.
 
 ### `decodeText(lines, options?)`
 
-| Option   | Type          | Default          | Description                                     |
-| -------- | ------------- | ---------------- | ----------------------------------------------- |
-| `config` | `ChunkConfig` | `DEFAULT_CONFIG` | Must match the config used to encode the lines. |
+| Option   | Type                            | Default          | Description                                     |
+| -------- | ------------------------------- | ---------------- | ----------------------------------------------- |
+| `config` | `ChunkConfig \| ResolvedConfig` | `DEFAULT_CONFIG` | Must match the config used to encode the lines. |
 
-`chunksFromLines`, `parseChunk`, `formatChunk`, `analyzeLines` accept an optional trailing `config` argument or `{ config }` object with the same semantics.
+> `chunksFromLines`, `parseChunk`, `formatChunk` and `generateSessionId` accept an optional trailing `config` argument; `decodeText` and `analyzeLines` take an options object instead, which accepts the same config either nested under `config` or in the options slot itself. Every one of them accepts **either** a partial `ChunkConfig` **or** a `ResolvedConfig` — see "Config normalization" above.
+>
+> `validateSessionId` / `parseHeader` are `@internal` — they enforce the same rules inside `formatChunk` / `parseChunk` but are not re-exported from the package entry point.
 
 ### `analyzeItems(items, options)`
 
 | Option    | Type                                 | Required | Description                                                  |
 | --------- | ------------------------------------ | -------- | ------------------------------------------------------------ |
 | `getLine` | `(item: T, index: number) => string` | yes      | Extract the base36 line from an item. The **only** contract. |
-| `config`  | `ChunkConfig`                        | no       | Must match the config used to encode the lines.              |
+| `config`  | `ChunkConfig \| ResolvedConfig`      | no       | Must match the config used to encode the lines.              |
 
 ### `Chunk` shape
 
@@ -354,19 +470,19 @@ interface ChunkConfig {
 interface AnalysisResult {
     ok: boolean; // all sessions complete & no malformed lines
     sessions: SessionAnalysis[]; // sorted by sessionId
-    malformed: ChunkIssue[]; // no recoverable session id
+    malformed: ChunkIssue[]; // no recoverable session id, sorted by line
 }
 
 interface SessionAnalysis {
     sessionId: string;
-    complete: boolean; // every index in [0, expectedTotal) present exactly once
+    complete: boolean; // all indices present exactly once, no total mismatch, no decode errors
     expectedTotal: number | null; // best-guess total; null on conflict
-    totalMismatch: boolean; // chunks disagree on `total`
+    totalMismatch: boolean; // chunks disagree on `total`, or nothing parsed
     chunks: Chunk[]; // sorted by index; empty if nothing parsed
     present: number[]; // indices that appear
     missing: number[]; // indices in [0, expectedTotal) not seen
     duplicates: number[]; // indices that appear more than once
-    errors: ChunkIssue[]; // per-line decode failures
+    errors: ChunkIssue[]; // per-line decode failures, sorted by line
 }
 
 interface ChunkIssue {
@@ -374,6 +490,9 @@ interface ChunkIssue {
     reason: string;
 }
 ```
+
+`totalMismatch` is `true` in two cases: chunks disagree on `total`, **or** no
+chunk could be parsed at all (then `expectedTotal` is `null`).
 
 ### `ItemizedAnalysisResult<T>` shape
 
@@ -503,6 +622,29 @@ Every encoded line is:
 Leading zero bytes of a chunk are not preserved by the bigint encoding;
 they are restored on decode using `count`.
 
+### What the integrity layer covers
+
+The checksum is computed over the **payload bytes only**:
+
+| Field     | Protected by                                                                                                                     |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `payload` | CRC8 / CRC16; with `checksum: "none"` — only the canonical-form check                                                            |
+| `session` | format check (`a-z`, then `[0-9a-z]`) and equality across the session                                                            |
+| `index`   | `0 ≤ index < total`; duplicates and gaps reported by `analyzeLines`                                                              |
+| `total`   | `≥ 1`, equal across the session, drives `missing`                                                                                |
+| `count`   | must match the decoded payload length; too small → `Byte count mismatch`, too large → re-padded with zeros and caught by the CRC |
+
+A corrupted `session`, `index`, or `total` therefore shows up as a _structural_ inconsistency — invalid prefix, duplicate index, gap, total mismatch — never as a CRC failure. `count` is the exception: it is not covered by the CRC either, but it is the field that tells the decoder **how many leading zero bytes to restore**, so corrupting it changes the byte array the CRC is computed over. A `count` that is too small fails the byte-count check; a `count` that is too large re-pads the payload with leading zeros and then fails the CRC. With `crc8`/`crc16` either case is an error, never a silent success. That is deliberate: extending the CRC over the header would cost payload bytes on every line, and the structural checks already make a silent reassembly impossible.
+
+This last guarantee comes from the checksum, not from the structure: with `checksum: "none"` a `count` that is too large still re-pads the payload, and the canonical-form check does not catch it (leading zeros are dropped when encoding, so the padded array is still "the shortest form"). The decoder then returns different bytes with no error. One more reason to keep a checksum unless the transport already guarantees integrity.
+
+Two payload rules are enforced by `parseChunk` in addition to the checksum:
+
+- **Canonical form.** A payload is the shortest base36 form of its bytes, so `'000a'` is rejected where `'a'` is expected. Otherwise one chunk would have several valid encodings, breaking deduplication, idempotent re-sends, and any signature over the line.
+- **Bounded length.** A line longer than `metaLength + 2004` chars (default layout) cannot be a valid chunk and is rejected before any bigint arithmetic — a hostile 5 MB line costs O(1) instead of minutes of CPU.
+
+With `checksum: "none"` the payload has no integrity protection beyond the canonical-form and `count` checks: a truncation that still decodes to exactly `count` bytes is undetectable. Use it only when the transport guarantees integrity.
+
 Because `session[0]` is constrained to `a-z`, every encoded line starts with
 a lowercase letter and therefore never begins with a digit. This is enforced
 by `parseHeader` / `validateSessionId` on the encoder side and by
@@ -518,14 +660,15 @@ With `DEFAULT_CONFIG` (`sessionLength = 6`, `checksum = "crc16"`, `metaLength = 
 - **Minimum `maxLen`:** `20` (one byte per chunk)
 - **Byte count field:** `36² = 1 296`, so per-chunk payload is capped at 1 295 bytes
 
-`metaLength` depends on the resolved config: `sessionLength + 3 + 3 + 2 + crcLength`. If you need a larger payload, widen `LAYOUT` in `src/config.js` — the decoder follows automatically because every width lives in one place.
+`metaLength` depends on the resolved config: `sessionLength + 3 + 3 + 2 + crcLength`. If you need a larger payload, widen `LAYOUT` in `src/config.js` — the decoder follows automatically because every width lives in one place. Raise the index and total widths together: `formatChunk` bounds the index by `indexLength`, so a wider `totalLength` alone does not raise the chunk ceiling.
 
 ## Configuration
 
 The wire format is controlled by a config object. The defaults are
 `{ sessionLength: 6, checksum: "crc16" }` — an **18-char header** that still
-fits **29 bytes of payload per line at `maxLen = 63`**, with CRC16 content
-integrity and a 6-char session id (safe for ~47 K concurrent sessions).
+fits **29 bytes of payload per line at `maxLen = 63`**, with CRC16 payload integrity and a 6-char session id.
+The 6-char space holds 1.57 × 10⁹ ids, which puts a ~50% chance of at least one collision
+at ~47 K _concurrent_ sessions — see the table below before picking a length.
 
 ```js
 import { createCodec } from '@supercat1337/base36-chunker';
@@ -547,11 +690,13 @@ same resolved config, so mismatched-config bugs are impossible.
 The session id is `[a-z]` followed by `config.sessionLength − 1` characters
 from `[0-9a-z]`, so the total space is `26 × 36^(sessionLength − 1)`.
 
-| Length | Space       | Birthday threshold | Use when                |
-| ------ | ----------- | ------------------ | ----------------------- |
-| 6      | 1.57 × 10⁹  | ~47 K sessions     | typical apps, chat, IoT |
-| 7      | 5.66 × 10¹⁰ | ~280 K sessions    | larger deployments      |
-| 8      | 2.04 × 10¹² | ~1.7 M sessions    | high-volume deployments |
+| Length | Space       | Birthday threshold (~50 % collision) | Use when                |
+| ------ | ----------- | ------------------------------------ | ----------------------- |
+| 6      | 1.57 × 10⁹  | ~47 K sessions                       | typical apps, chat, IoT |
+| 7      | 5.66 × 10¹⁰ | ~280 K sessions                      | larger deployments      |
+| 8      | 2.04 × 10¹² | ~1.7 M sessions                      | high-volume deployments |
+
+The threshold grows with the square of the session count: at a tenth of it the collision probability is about 1 %. Reserve session ids from a counter or a database if the live count can exceed a few thousand, or use `sessionLength: 8`.
 
 ### Checksum choice
 
@@ -568,13 +713,13 @@ Payload capacity at `maxLen = 63` (`sessionLength = 6`):
 value; four are required (`36⁴ = 1 679 616`). In base62 three chars were
 enough because `62³ = 238 328 ≥ 65 536`.
 
-**Why `crc16` is still the default:** without a checksum, a single-character
-substitution inside the payload goes undetected in **10–30 %** of cases
-(depending on chunk size) — the decoder still returns _a_ string, just not
-the original one. CRC16 essentially eliminates that. At `maxLen = 63` it
-costs **exactly 1 byte per chunk** compared to `crc8` (29 vs 30 bytes) and
-1 byte compared to `none` (29 vs 31). Given the safety margin — 99.998 % vs
-99.6 % detection — the cost is negligible.
+**Why `crc16` is still the default:** without a checksum, a single-character substitution inside the payload is caught only when the new value needs more bytes than `count` allows. That is a **sawtooth** in chunk size, not a fixed percentage — and it is far worse than "a few percent":
+
+| `count` (bytes) | 1      | 2     | 3      | 5      | 9      | 10     | 16     | 20     | 25     | 29     |
+| --------------- | ------ | ----- | ------ | ------ | ------ | ------ | ------ | ------ | ------ | ------ |
+| Undetected      | 17.5 % | 1.2 % | 25.7 % | 37.2 % | 76.2 % | 12.8 % | 40.5 % | 82.6 % | 30.4 % | 62.8 % |
+
+At the default 29-byte chunk **~63 %** of single-character substitutions go unnoticed — the decoder still returns _a_ string, just not the original one. CRC16 essentially eliminates that. At `maxLen = 63` it costs **exactly 1 byte per chunk** compared to `crc8` (29 vs 30) and **2 bytes** compared to `none` (29 vs 31). Given the safety margin — 99.998 % vs 99.6 % detection — the cost is negligible.
 
 ## Examples
 
@@ -597,13 +742,11 @@ Typical scenarios:
 If you are an AI agent extending this package, read these files in order:
 
 1. `src/types.ts` — the public `Chunk`, `ChunkConfig`, `ResolvedConfig`,
-   `Codec`, `EncodeOptions`, `DecodeOptions`, `AnalyzeOptions`,
-   `AnalyzeItemsOptions`, `AnalysisResult`, `ItemizedAnalysisResult`,
-   `SessionAnalysis`, `ItemizedSessionAnalysis`, `ChunkIssue`,
-   `ItemizedChunkIssue` contracts. The `@internal` helper types
-   `ChunkHeader`, `Bucket`, and `ItemBucket` also live here.
-2. `src/config.js` — header layout constants, `resolveConfig`,
-   `DEFAULT_CONFIG`.
+   `Codec`, `EncodeOptions`, `ConfigOptions`, `AnalyzeItemsOptions`, `AnalysisResult`,
+   `ItemizedAnalysisResult`, `SessionAnalysis`, `ItemizedSessionAnalysis`,
+   `ChunkIssue`, `ItemizedChunkIssue` contracts.
+2. `src/config.js` — header layout constants (`LAYOUT`), `CHECKSUM_LENGTHS`,
+   `resolveConfig`, `ensureConfig`, `ensureOptionsConfig`, `DEFAULT_CONFIG`.
 3. `src/crc.js` — CRC8 / CRC16 tables and `computeChecksum`.
 4. `src/chunk.js` — line format (`parseChunk` / `formatChunk`), header parse,
    and the `@internal` regex constants `SESSION_PREFIX_RE`, `FIRST_CHAR_RE`,
@@ -611,24 +754,46 @@ If you are an AI agent extending this package, read these files in order:
 5. `src/encode.js`, `src/decode.js`, `src/analyze.js` — the three top flows.
 6. `src/codec.js` — the `createCodec` factory (also wires `analyzeItems`
    into the returned bundle).
-7. `src/index.d.ts` — the single entry point api-extractor reads.
+7. `src/index.d.ts` — the single entry point api-extractor reads (via the
+   generated copy at `dist/types-temp/src/index.d.ts`).
+8. **`ChunkIssue.line` is an array index, not a text line number.** In
+   `analyzeItems` it indexes `items[]`. Never rename it to `row`/`index`
+   without a major version, and never let generated docs describe it as a
+   source line.
 
 Rules that are easy to miss:
 
+- **Every function that takes a config must go through `ensureConfig`; every
+  function that takes an options object must go through `ensureOptionsConfig`.**
+  `ensureConfig` covers the bare config slots (`parseChunk(line, cfg)`);
+  `ensureOptionsConfig` covers `{ config }` _and_ a config passed in the
+  options slot, which the README documents as equivalent. Both must reject
+  unknown fields — a typo must raise, never fall back to `DEFAULT_CONFIG`,
+  because a different layout silently turns every line into `malformed`.
+  Never read `config.sessionLength` / `config.metaLength`
+  directly from a user-supplied object — a partial config will give you
+  `undefined` and silently corrupt the line.
 - **Do not re-introduce a `getSessionId` helper.** The session id is
   `line.slice(0, config.sessionLength)` (6 by default); grouping is
   `analyzeLines` / `analyzeItems`' job.
 - **`analyzeLines` and `analyzeItems` must never throw on bad input.**
   Malformed lines, duplicates, missing indices, checksum failures, and
   `getLine` exceptions are data — they belong in the report. Only a
-  non-array argument (or non-function `getLine`) is a `TypeError`.
+  non-array argument, a non-function `getLine`, or a non-object config is a
+  `TypeError`; out-of-range config fields are a `RangeError`.
 - **`analyzeItems` must not assume anything about field names.** `getLine`
   is the only contract; `item` is preserved verbatim. Do not add
   `item.id` / `item.chunk` shortcuts — users may have `recordId`, `uuid`,
   nested `payload.line`, or no id at all.
+- **`analyzeItems` requires `options`; `analyzeLines` does not.** There is
+  no sensible default for `getLine`, so the parameter is mandatory — a
+  TypeScript caller must not be able to write a call that is guaranteed to
+  throw. Keep the `options?.getLine` optional chain anyway: JS callers can
+  still pass `undefined`, and the `TypeError` message must stay readable.
 - **`session.items[j]` must stay parallel to `session.chunks[j]`.**
-  Whenever `chunks` is sorted by `index`, `items` must be sorted the same
-  way — implement them as one sortable pair, never independently.
+  Both `analyzeLines` and `analyzeItems` delegate to the shared
+  `summarize()` helper, which sorts entries once. Do not fork this logic —
+  implement them as one sortable pair, never independently.
 - **Do not duplicate the session-prefix regex.** `SESSION_PREFIX_RE`,
   `FIRST_CHAR_RE`, and `BASE36_RE` are `@internal` constants in `chunk.js`.
   `analyzeLines` and `analyzeItems` both import `SESSION_PREFIX_RE` from
@@ -645,10 +810,17 @@ Rules that are easy to miss:
 - Everything tagged `@internal` is stripped from `dist/types.d.ts` by
   `stripInternal` — do not rely on it in user-facing docs. Verify after
   every build with
-  `grep -E "ChunkHeader|Bucket|ItemBucket" dist/types.d.ts` — must be empty.
+  `grep -E "SessionSummary|ChunkHeader|Bucket|ItemBucket|ensureConfig|ensureOptionsConfig|CHECKSUM_LENGTHS|LOG2_BASE36|errorMessage|compareSessionIds|randomChars|utf8CharLength" dist/types.d.ts`
+  — must be empty.
+- **Helpers exported for tests are still `@internal`.** `randomChars`,
+  `utf8CharLength`, `errorMessage`, and `compareSessionIds` are exported
+  from their modules so tests can reach them, but they are **not**
+  re-exported from `src/index.js`. Do not add them to the public entry
+  point.
 - Every `.js` file in `src/` and `tests/` starts with `// @ts-check`.
-- Tests use `ava` with a single assertion per `test()`, and names follow
-  `<module>: <behavior>`.
+  Do **not** add it to `.ts` files — it is a no-op there and only adds noise.
+- Tests use `ava`; names follow `<module>: <behavior>`. A single test may
+  contain several assertions when they describe one scenario.
 - Never add `overrides` to `package.json`; use `npm link` for local
   development.
 - The dependency graph is strictly
@@ -662,6 +834,32 @@ Rules that are easy to miss:
   `items`/`chunks` guarantee. The only difference: the codec supplies
   `config` from its resolved state. Do not add a `config` option to
   `codec.analyzeItems` — the codec already owns it.
+- **`splitText` must never break a UTF-8 character.** A chunk boundary is
+  only allowed at a byte that is not a continuation byte (`0b10xxxxxx`).
+  `bytesPerChunk` is a hard upper bound — if a character does not fit,
+  throw `RangeError`, do not silently exceed it. `total` is the actual
+  chunk count, not `ceil(len / bytesPerChunk)`.
+- **`joinChunks` must decode with `{ fatal: true }`.** Returning a string
+  with U+FFFD is silent data corruption; throwing is the correct behavior.
+- **`joinChunks` is a thin wrapper over `joinBytes`.** Session validation
+  lives in `validateChunks()` and must not be duplicated. Do not add an
+  `{ as: 'bytes' }` option to `joinChunks` — the return type would become
+  `string | Uint8Array`, which is hostile to TypeScript consumers. Binary
+  payloads go through `joinBytes`.
+- **`parseChunk` must reject non-canonical payloads.** `bytesToBase36(bytes)`
+  must equal the payload slice. Otherwise one chunk has several valid
+  encodings — breaking dedupe, idempotent re-sends and signatures — and a
+  truncated tail can decode to zeros.
+- **`parseHeader` must cap the line length before decoding.** A valid chunk is
+  at most `metaLength + ceil(maxByteCount * 8 / log2 36)` chars; anything
+  longer is rejected in O(1). Without the cap, `parseChunk` runs a quadratic
+  bigint loop over attacker-controlled input.
+- **The checksum covers the payload only.** Do not move header fields under
+  the CRC without a wire-format version bump; header corruption is surfaced
+  structurally (`duplicates`, `missing`, `totalMismatch`) by design.
+- **`splitText` must reject unpaired surrogates** with `TypeError` instead of
+  letting `TextEncoder` substitute U+FFFD — `decodeText(encodeText(text)) ===
+text` is the package's core promise.
 
 ## License
 

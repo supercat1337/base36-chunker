@@ -12,9 +12,9 @@ test('createCodec: no args uses DEFAULT_CONFIG', t => {
     t.deepEqual(codec.config, DEFAULT_CONFIG);
 });
 
-test('createCodec: exposes metaLen matching config', t => {
+test('createCodec: exposes metaLength matching config', t => {
     const codec = createCodec();
-    t.is(codec.metaLen, codec.config.metaLength);
+    t.is(codec.metaLength, codec.config.metaLength);
 });
 
 test('createCodec: resolves partial config', t => {
@@ -185,4 +185,98 @@ test('codec.analyzeItems: keeps items parallel to chunks', t => {
         report.sessions[0].items.map(r => r.id),
         [0]
     );
+});
+
+// ── crc8 round-trip ─────────────────────────────────────────────────────────
+
+test('codec: crc8 metaLength is 16', t => {
+    const codec = createCodec({ checksum: 'crc8' });
+    t.is(codec.metaLength, 16);
+});
+
+test('codec: crc8 roundtrips ASCII', t => {
+    const codec = createCodec({ checksum: 'crc8' });
+    t.is(codec.decodeText(codec.encodeText('Hello, World!')), 'Hello, World!');
+});
+
+test('codec: crc8 roundtrips Cyrillic', t => {
+    const codec = createCodec({ checksum: 'crc8' });
+    t.is(codec.decodeText(codec.encodeText('Привет, мир!')), 'Привет, мир!');
+});
+
+test('codec: crc8 roundtrips multi-chunk', t => {
+    const codec = createCodec({ checksum: 'crc8' });
+    const text = 'Lorem ipsum dolor sit amet. '.repeat(50);
+    t.is(codec.decodeText(codec.encodeText(text, { maxLen: 40 })), text);
+});
+
+test('codec: crc8 at maxLen 63 fits 30 bytes', t => {
+    const codec = createCodec({ sessionLength: 6, checksum: 'crc8' });
+    t.is(codec.splitText('x'.repeat(30), { maxLen: 63 }).length, 1);
+});
+
+test('codec: crc8 detects single-char payload substitution', t => {
+    const codec = createCodec({ checksum: 'crc8' });
+    const [head] = codec.encodeText('hello world, this is a test');
+    const metaLength = codec.metaLength;
+    const tampered =
+        head.slice(0, metaLength + 3) +
+        (head[metaLength + 3] === 'a' ? 'b' : 'a') +
+        head.slice(metaLength + 4);
+    t.throws(() => codec.decodeText([tampered]), { message: /Checksum mismatch/ });
+});
+
+test('codec: crc8 lines are rejected by crc16 codec', t => {
+    const a = createCodec({ checksum: 'crc8' });
+    const b = createCodec({ checksum: 'crc16' });
+    t.throws(() => b.decodeText(a.encodeText('hello')));
+});
+
+test('codec.joinBytes: returns raw bytes', t => {
+    const codec = createCodec();
+    const bytes = new Uint8Array([0xff, 0x00]);
+    const line = codec.formatChunk({ session: 'abcd12', index: 0, total: 1, bytes });
+    t.deepEqual(codec.joinBytes(codec.chunksFromLines([line])), bytes);
+});
+
+test('codec.joinBytes: roundtrips multi-chunk binary', t => {
+    const codec = createCodec();
+    const payload = Uint8Array.from({ length: 200 }, (_, i) => (i * 7) & 0xff);
+    const per = 29;
+    const total = Math.ceil(payload.length / per);
+    const chunks = Array.from({ length: total }, (_, i) => ({
+        session: 'abcd12',
+        index: i,
+        total,
+        bytes: payload.slice(i * per, (i + 1) * per),
+    }));
+    t.deepEqual(codec.joinBytes(chunks), payload);
+});
+
+test('DEFAULT_CONFIG is frozen', t => {
+    t.throws(
+        () => {
+            /** @type {any} */ (DEFAULT_CONFIG).sessionLength = 8;
+        },
+        { instanceOf: TypeError }
+    );
+});
+
+test('createCodec: config is frozen and stays in sync with metaLength', t => {
+    const codec = createCodec({ checksum: 'crc8' });
+    t.true(Object.isFrozen(codec.config));
+    t.is(codec.metaLength, codec.config.metaLength);
+    t.throws(
+        () => {
+            /** @type {any} */ (codec.config).checksum = 'crc16';
+        },
+        { instanceOf: TypeError }
+    );
+});
+
+test('createCodec: caller object is not frozen in place', t => {
+    const partial = { checksum: /** @type {const} */ ('crc8') };
+    const codec = createCodec(partial);
+    t.false(Object.isFrozen(partial));
+    t.true(Object.isFrozen(codec.config));
 });

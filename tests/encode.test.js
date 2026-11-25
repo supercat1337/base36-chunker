@@ -4,6 +4,7 @@ import test from 'ava';
 
 import { DEFAULT_CONFIG, resolveConfig } from '../src/config.js';
 import { encodeText, generateSessionId, splitText } from '../src/encode.js';
+import { decodeText } from '../src/decode.js';
 
 const { metaLength } = DEFAULT_CONFIG;
 
@@ -41,7 +42,7 @@ test('encodeText: respects maxLen', t => {
 
 test('encodeText: rejects maxLen <= metaLength', t => {
     t.throws(() => encodeText('x', { maxLen: 10 }), {
-        message: /must be greater than META_LEN/,
+        message: /must be greater than metaLength/,
     });
 });
 
@@ -65,3 +66,65 @@ test('splitText: deterministic for a fixed sessionId', t => {
     t.deepEqual(splitText('some text '.repeat(10), opts), splitText('some text '.repeat(10), opts));
 });
 
+// ── UTF-8 safety ────────────────────────────────────────────────────────────
+
+test('splitText: never splits inside a UTF-8 character', t => {
+    const text = '😀'.repeat(10); // 4 bytes each
+    const chunks = splitText(text, { bytesPerChunk: 5 });
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    t.true(
+        chunks.every(c => {
+            try {
+                decoder.decode(c.bytes);
+                return true;
+            } catch {
+                return false;
+            }
+        })
+    );
+});
+
+test('splitText: roundtrips emoji', t => {
+    const text = '😀'.repeat(100);
+    t.is(decodeText(encodeText(text, { maxLen: 40 })), text);
+});
+
+test('splitText: roundtrips mixed ASCII / Cyrillic / emoji', t => {
+    const text = 'aПривет😀'.repeat(50);
+    t.is(decodeText(encodeText(text, { maxLen: 40 })), text);
+});
+
+test('splitText: bytesPerChunk = 4 fits one emoji per chunk', t => {
+    const chunks = splitText('😀😀', { bytesPerChunk: 4 });
+    t.deepEqual(
+        chunks.map(c => c.bytes.length),
+        [4, 4]
+    );
+});
+
+test('splitText: bytesPerChunk = 8 fits two emoji per chunk', t => {
+    const chunks = splitText('😀😀', { bytesPerChunk: 8 });
+    t.deepEqual(
+        chunks.map(c => c.bytes.length),
+        [8]
+    );
+});
+
+test('splitText: rejects bytesPerChunk too small for a 4-byte character', t => {
+    t.throws(() => splitText('😀', { bytesPerChunk: 3 }), {
+        message: /too small for a 4-byte UTF-8 character/,
+    });
+});
+
+test('splitText: rejects bytesPerChunk too small for a 2-byte character', t => {
+    t.throws(() => splitText('é', { bytesPerChunk: 1 }), {
+        message: /too small for a 2-byte UTF-8 character/,
+    });
+});
+
+test('splitText: ASCII is unaffected by the UTF-8 back-off', t => {
+    t.deepEqual(
+        splitText('abcdefghij', { bytesPerChunk: 3 }).map(c => c.bytes.length),
+        [3, 3, 3, 1]
+    );
+});

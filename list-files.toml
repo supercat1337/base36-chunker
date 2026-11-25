@@ -1,0 +1,41 @@
+# Base include patterns.
+# - If the CLI passes at least one -i, the CLI list replaces this entirely.
+# - Otherwise this list is used as-is.
+# - If neither is set, the default is ["**/*"].
+include = ["**/*"]
+
+# Base exclude patterns. CLI -e flags are appended to this list
+# (deduplicated). Exclusion is always additive.
+#
+# For directory patterns, prefer matching the directory itself (no
+# trailing /**) so the walk prunes it entirely instead of descending
+# into it. File patterns (e.g. "**/*.test.js") are unaffected.
+exclude = [
+    "**/node_modules",
+    "**/.git",
+    "**/coverage",
+    "**/dist",
+    "**/.next",
+    "tree.txt",
+    ".tree-tool.toml",
+    "list.txt",
+    "list-files.toml",
+    "LICENSE.txt",
+    "**.md",
+    "package-lock.json",
+    ".prettierrc",
+    ".gitignore",
+]
+
+# Default for --gitignore. Turn off per-run with --no-gitignore.
+gitignore = true
+
+# Default for --absolute. Turn off per-run with --no-absolute.
+absolute = false
+
+# Default base for relative paths (same as --relative-to).
+# Resolved against process.cwd(), not against the config file location.
+# relative_to = "."
+
+# Default output file (same as --output).
+# output = "files.txt"

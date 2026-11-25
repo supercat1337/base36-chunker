@@ -38,18 +38,29 @@ const CHAR_VALUE = (() => {
 
 /**
  * Encode a non-negative integer into a fixed-width base36 string.
- * Zero-padded on the left.
+ * Zero-padded on the left. `encodeNumber(0, 0)` returns `''`.
  *
  * @internal
  * @param {number} value  Non-negative safe integer.
  * @param {number} width  Exact output length in characters.
  * @returns {string}
- * @throws {RangeError} If `value` does not fit into `width` base36 digits.
+ * @throws {RangeError} If `value` or `width` are not non-negative integers,
+ *                      or `value` does not fit into `width` base36 digits.
  */
 export function encodeNumber(value, width) {
     if (!Number.isInteger(value) || value < 0) {
         throw new RangeError(`Expected non-negative integer, got ${value}`);
     }
+    if (!Number.isInteger(width) || width < 0) {
+        throw new RangeError(`Width must be a non-negative integer, got ${width}`);
+    }
+    if (width === 0) {
+        if (value !== 0) {
+            throw new RangeError(`Value ${value} does not fit into 0 base36 characters`);
+        }
+        return '';
+    }
+
     let acc = value;
     const chars = new Array(width);
     for (let i = width - 1; i >= 0; i -= 1) {
@@ -63,7 +74,8 @@ export function encodeNumber(value, width) {
 }
 
 /**
- * Decode a base36 string into a non-negative integer.
+ * Decode a base36 string into a non-negative integer. An empty string
+ * decodes to `0`.
  *
  * @internal
  * @param {string} str
@@ -95,7 +107,9 @@ export function decodeNumber(str) {
  * @returns {string}
  */
 export function bytesToBase36(bytes) {
-    if (bytes.length === 0) return '';
+    if (bytes.length === 0) {
+        return '';
+    }
     let acc = 0n;
     for (let i = 0; i < bytes.length; i += 1) {
         acc = (acc << 8n) | BigInt(bytes[i]);
@@ -117,9 +131,16 @@ export function bytesToBase36(bytes) {
  * @param {string} str
  * @param {number} expectedLength  Number of bytes to restore.
  * @returns {Uint8Array}
+ * @throws {RangeError} If `expectedLength` is not a non-negative integer.
  * @throws {Error} On invalid characters or byte-count mismatch.
  */
 export function base36ToBytes(str, expectedLength) {
+    if (!Number.isInteger(expectedLength) || expectedLength < 0) {
+        throw new RangeError(
+            `expectedLength must be a non-negative integer, got ${expectedLength}`
+        );
+    }
+
     let acc = 0n;
     for (let i = 0; i < str.length; i += 1) {
         const code = str.charCodeAt(i);
@@ -151,19 +172,41 @@ export function base36ToBytes(str, expectedLength) {
  * `floor(256 / n) * n` are discarded, so every character is drawn with
  * probability `1 / n` (no modulo bias).
  *
+ * Exported for tests only — not part of the public API.
+ *
  * @internal
  * @param {string} alphabet
  * @param {number} count
  * @returns {string[]}
+ * @throws {RangeError} If `alphabet` is empty or `count` is not a
+ *                      non-negative integer.
+ * @throws {Error} If `globalThis.crypto.getRandomValues` is unavailable.
  */
-function randomChars(alphabet, count) {
+export function randomChars(alphabet, count) {
     const n = alphabet.length;
+    if (n === 0) {
+        throw new RangeError('alphabet must not be empty');
+    }
+    if (!Number.isInteger(count) || count < 0) {
+        throw new RangeError(`count must be a non-negative integer, got ${count}`);
+    }
+    if (count === 0) {
+        return [];
+    }
+
+    const crypto = globalThis.crypto;
+    if (!crypto || typeof crypto.getRandomValues !== 'function') {
+        throw new Error(
+            'globalThis.crypto.getRandomValues is not available (Node.js >= 19 required)'
+        );
+    }
+
     const limit = Math.floor(256 / n) * n;
     /** @type {string[]} */
     const out = [];
     const batch = new Uint8Array(Math.max(16, count * 2));
     while (out.length < count) {
-        globalThis.crypto.getRandomValues(batch);
+        crypto.getRandomValues(batch);
         for (let i = 0; i < batch.length && out.length < count; i += 1) {
             if (batch[i] < limit) {
                 out.push(alphabet[batch[i] % n]);
@@ -185,9 +228,15 @@ function randomChars(alphabet, count) {
  * @param {number} length
  * @param {string} [firstCharAlphabet]
  * @returns {string}
+ * @throws {RangeError} If `length` is not a non-negative integer.
  */
 export function randomBase36(length, firstCharAlphabet = ALPHABET) {
-    if (length === 0) return '';
+    if (!Number.isInteger(length) || length < 0) {
+        throw new RangeError(`length must be a non-negative integer, got ${length}`);
+    }
+    if (length === 0) {
+        return '';
+    }
     const first = randomChars(firstCharAlphabet, 1)[0];
     return first + randomChars(ALPHABET, length - 1).join('');
 }

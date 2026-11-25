@@ -22,11 +22,11 @@ test('createCodec: detects single-char payload substitution', t => {
     const codec = createCodec();
     const lines = codec.encodeText('hello world, this is a test');
     const [head] = lines;
-    const metaLen = codec.metaLen;
+    const metaLength = codec.metaLength;
     const tampered =
-        head.slice(0, metaLen + 3) +
-        (head[metaLen + 3] === 'a' ? 'b' : 'a') +
-        head.slice(metaLen + 4);
+        head.slice(0, metaLength + 3) +
+        (head[metaLength + 3] === 'a' ? 'b' : 'a') +
+        head.slice(metaLength + 4);
     t.throws(() => codec.decodeText([tampered]), { message: /Checksum mismatch/ });
 });
 
@@ -49,3 +49,4 @@ test('createCodec: 29-byte payload fits in 63-char line', t => {
     t.is(lines.length, 1);
     t.true(lines[0].length <= 63);
 });
+

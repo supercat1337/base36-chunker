@@ -1,34 +1,38 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/api-extractor/v7/api-extractor.schema.json",
-  "projectFolder": ".",
-  "mainEntryPointFilePath": "<projectFolder>/dist/types-temp/src/index.d.ts",
-  "compiler": {
-    "tsconfigFilePath": "<projectFolder>/my.tsconfig.types.json"
-  },
-  "apiReport": {
-    "enabled": true,
-    "reportFolder": "<projectFolder>/etc/",
-    "reportFileName": "base36-chunker.api.md",
-    "reportTempFolder": "<projectFolder>/dist/api-report-temp/"
-  },
-  "docModel": { "enabled": false },
-  "dtsRollup": {
-    "enabled": true,
-    "untrimmedFilePath": "",
-    "publicTrimmedFilePath": "<projectFolder>/dist/types.d.ts"
-  },
-  "tsdocMetadata": { "enabled": false },
-  "messages": {
-    "compilerMessageReporting": {
-      "default": { "logLevel": "warning" }
+    "$schema": "https://developer.microsoft.com/json-schemas/api-extractor/v7/api-extractor.schema.json",
+    "projectFolder": ".",
+    "mainEntryPointFilePath": "<projectFolder>/dist/types-temp/src/index.d.ts",
+    "compiler": {
+        "tsconfigFilePath": "<projectFolder>/my.tsconfig.types.json"
     },
-    "extractorMessageReporting": {
-      "default": { "logLevel": "warning" },
-      "ae-missing-release-tag": { "logLevel": "none" },
-      "ae-forgotten-export": { "logLevel": "none" }
+    "apiReport": {
+        "enabled": true,
+        "reportFolder": "<projectFolder>/etc/",
+        "reportFileName": "base36-chunker.api.md",
+        "reportTempFolder": "<projectFolder>/dist/api-report-temp/"
     },
-    "tsdocMessageReporting": {
-      "default": { "logLevel": "none" }
+    "docModel": {
+        "enabled": false,
+        "apiJsonFilePath": "<projectFolder>/etc/<unscopedPackageName>.api.json"
+    },
+    "dtsRollup": {
+        "enabled": true,
+        "untrimmedFilePath": "",
+        "publicTrimmedFilePath": "<projectFolder>/dist/types.d.ts"
+    },
+    "tsdocMetadata": { "enabled": false },
+    "messages": {
+        "compilerMessageReporting": {
+            "default": { "logLevel": "error" }
+        },
+        "extractorMessageReporting": {
+            "default": { "logLevel": "warning" },
+            "ae-missing-release-tag": { "logLevel": "warning" },
+            "ae-forgotten-export": { "logLevel": "error" },
+            "ae-incompatible-release-tags": { "logLevel": "error" }
+        },
+        "tsdocMessageReporting": {
+            "default": { "logLevel": "none" }
+        }
     }
-  }
 }

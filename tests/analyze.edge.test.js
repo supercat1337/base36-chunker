@@ -96,3 +96,37 @@ test('analyzeItems: digit-leading session goes to malformed with .item', t => {
     t.is(report.malformed.length, 1);
     t.is(report.malformed[0].item.id, 7);
 });
+
+test('analyzeLines: invalid config raises RangeError', t => {
+    t.throws(() => analyzeLines([], { config: { sessionLength: /** @type {any} */ (3) } }), {
+        instanceOf: RangeError,
+    });
+});
+
+test('analyzeLines: null options falls back to defaults', t => {
+    const lines = encodeText('hello', { sessionId: 'abcd12' });
+    t.true(analyzeLines(lines, /** @type {any} */ (null)).ok);
+});
+
+test('analyzeLines: errors are sorted by line', t => {
+    const good = encodeText('hello', { sessionId: 'abcd12' })[0];
+    const bad = good.slice(0, 10) + '!' + good.slice(11);
+    const report = analyzeLines([bad, good, bad]);
+    t.deepEqual(
+        report.sessions[0].errors.map(e => e.line),
+        [0, 2]
+    );
+});
+
+test('analyzeItems: explicit undefined options raises TypeError', t => {
+    // `options` is required by the type; this covers the JS-caller path.
+    t.throws(() => analyzeItems([], /** @type {any} */ (undefined)), {
+        message: /getLine must be a function/,
+    });
+});
+
+test('analyzeItems: null options raises TypeError', t => {
+    t.throws(() => analyzeItems([], /** @type {any} */ (null)), {
+        message: /getLine must be a function/,
+    });
+});

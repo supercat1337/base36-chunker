@@ -1,5 +1,3 @@
-// @ts-check
-
 /**
  * Logical chunk of a payload. Carries everything needed to serialize it to
  * a base36 line (via {@link formatChunk}) or to reassemble the original
@@ -30,6 +28,10 @@ export interface Chunk {
     /**
      * Payload bytes for this chunk (UTF-8 for text). The number of bytes is
      * `bytes.length`; it is written into the count field of the encoded line.
+     *
+     * Leading zero bytes are preserved by the header, not by the payload:
+     * `formatChunk` writes only the significant base36 digits, and
+     * `parseChunk` restores exactly `bytes.length` bytes using `count`.
      */
     bytes: Uint8Array;
 }
@@ -46,24 +48,40 @@ export interface ChunkConfig {
      * letter (`a-z`); the remaining characters are drawn from the full
      * base36 alphabet.
      *
-     * Larger = safer against cross-session collisions; smaller = more payload
-     * per line. Approximate birthday-collision thresholds:
+     * The id space is `26 × 36^(sessionLength − 1)`. The figures below are
+     * **birthday thresholds** — the number of concurrent sessions at which
+     * the probability of at least one collision reaches ~50%. They are not
+     * "safe" limits: keep the live session count an order of magnitude below
+     * the threshold for a low collision risk.
      *
-     * - `6` → ~47 K concurrent sessions
-     * - `7` → ~280 K concurrent sessions
-     * - `8` → ~1.7 M concurrent sessions
+     * - `6` → ~47 K sessions (1.57 × 10⁹ ids)
+     * - `7` → ~280 K sessions (5.66 × 10¹⁰ ids)
+     * - `8` → ~1.7 M sessions (2.04 × 10¹² ids)
+     *
+     * A collision is not silent data loss: two payloads that share a session
+     * id surface in `analyzeLines` as one session with duplicate indices
+     * and/or a total mismatch, so `complete` stays `false` instead of two
+     * documents being concatenated.
      *
      * @defaultValue 6
      */
     sessionLength?: 4 | 5 | 6 | 7 | 8;
 
     /**
-     * Checksum algorithm applied to each chunk's payload.
+     * Checksum algorithm applied to each chunk's **payload bytes**.
      *
      * - `"none"`  — no checksum (0 header chars)
      * - `"crc8"`  — CRC-8/MAXIM (2 header chars)
      * - `"crc16"` — CRC-16/CCITT (4 header chars; a 16-bit value does not
      *   fit into 3 base36 digits, since `36³ = 46 656 < 65 536`)
+     *
+     * The checksum covers the payload and nothing else. `index`, `total`,
+     * and `count` are validated structurally instead: `total` must be ≥ 1
+     * and agree across the session, `index` must be `< total`, and the
+     * payload must occupy exactly `count` bytes in canonical form. A
+     * corrupted header field therefore appears as a structural
+     * inconsistency (duplicate or missing index, total mismatch) rather
+     * than as a checksum failure.
      *
      * @defaultValue "crc16"
      */
@@ -133,32 +151,33 @@ export interface EncodeOptions {
 
     /**
      * Override the default wire format. Omitted fields inherit defaults.
+     * A `ResolvedConfig` from {@link resolveConfig} is accepted as well and
+     * used unchanged (re-resolved only if it is internally inconsistent).
      */
-    config?: ChunkConfig;
+    config?: ChunkConfig | ResolvedConfig;
 }
 
 /**
- * Options for {@link decodeText}.
+ * Options for {@link analyzeLines} and {@link decodeText}.
+ *
+ * All three shapes resolve to the same wire format:
+ *
+ * - `{ config: { sessionLength: 8 } }` — explicit nested override;
+ * - `{ config: resolvedConfig }`        — a config from {@link resolveConfig};
+ * - `{ sessionLength: 8 }`, or a resolved config passed directly — the
+ *   config in the options slot itself.
+ *
+ * `{ config: … }` and the bare fields are mutually exclusive; passing both
+ * is a `TypeError`. Unknown keys raise as well: a misspelled option would
+ * otherwise fall back to `DEFAULT_CONFIG` and silently make every line of a
+ * different layout look `malformed`.
+ *
  * @public
  */
-export interface DecodeOptions {
-    /**
-     * Must match the config used to encode the lines, otherwise the checksum
-     * or the header parse fails.
-     */
-    config?: ChunkConfig;
-}
-
-/**
- * Options for {@link analyzeLines}.
- * @public
- */
-export interface AnalyzeOptions {
-    /**
-     * Must match the config used to encode the lines.
-     */
-    config?: ChunkConfig;
-}
+export type ConfigOptions =
+    | { config?: ChunkConfig | ResolvedConfig }
+    | ChunkConfig
+    | ResolvedConfig;
 
 /**
  * A single problem detected in an array of encoded lines. Used both for
@@ -191,7 +210,10 @@ export interface SessionAnalysis {
     complete: boolean;
     /** Best-guess chunk count, or `null` if chunks disagree or none parsed. */
     expectedTotal: number | null;
-    /** `true` if chunks disagree on `total`, or nothing could be parsed. */
+    /**
+     * `true` if chunks disagree on `total`, or if no chunk could be parsed
+     * (so `expectedTotal` is `null`).
+     */
     totalMismatch: boolean;
     /** Successfully decoded chunks, sorted by `index`. */
     chunks: Chunk[];
@@ -201,7 +223,10 @@ export interface SessionAnalysis {
     missing: number[];
     /** Indices that appear more than once. */
     duplicates: number[];
-    /** Lines whose session was recovered but whose payload failed to parse. */
+    /**
+     * Lines whose session was recovered but whose payload failed to parse,
+     *  sorted by `line`.
+     */
     errors: ChunkIssue[];
 }
 
@@ -215,7 +240,7 @@ export interface AnalysisResult {
     ok: boolean;
     /** Per-session analyses, sorted by `sessionId`. */
     sessions: SessionAnalysis[];
-    /** Lines whose session id could not be recovered at all. */
+    /** Lines whose session id could not be recovered at all, sorted by `line`. */
     malformed: ChunkIssue[];
 }
 
@@ -228,15 +253,17 @@ export interface AnalysisResult {
  */
 export interface Codec {
     /** Resolved config shared by all methods. */
-    config: ResolvedConfig;
+    config: Readonly<ResolvedConfig>;
     /** Shortcut for `config.metaLength`. */
-    metaLen: number;
+    metaLength: number;
     /** Split text into base36-only lines. */
     encodeText: (text: string, options?: Omit<EncodeOptions, 'config'>) => string[];
     /** Reassemble text from base36-only lines. Throws on any inconsistency. */
     decodeText: (lines: string[]) => string;
     /** Split text into {@link Chunk} structures. */
     splitText: (text: string, options?: Omit<EncodeOptions, 'config'>) => Chunk[];
+    /** Concatenate payload bytes of a complete session — no UTF-8 decoding. */
+    joinBytes: (chunks: Chunk[]) => Uint8Array;
     /** Reassemble text from {@link Chunk} structures. */
     joinChunks: (chunks: Chunk[]) => string;
     /** Parse a single line into a {@link Chunk}. */
@@ -249,9 +276,10 @@ export interface Codec {
     analyzeLines: (lines: string[]) => AnalysisResult;
     /** Non-throwing integrity analysis over arbitrary items; `config` is
      *  supplied by the codec, so it cannot diverge from encode/decode. */
+    // keyof (A | B) === 'getLine'  →  Omit<…> === { getLine: (item: T, index: number) => string }
     analyzeItems: <T>(
         items: T[],
-        options: Omit<AnalyzeItemsOptions<T>, 'config'>
+        options: Omit<AnalyzeItemsOptions<T>, 'config' | 'sessionLength' | 'checksum'>
     ) => ItemizedAnalysisResult<T>;
     /** Filter the report down to complete sessions. */
     completeSessions: (report: AnalysisResult) => SessionAnalysis[];
@@ -305,15 +333,36 @@ export interface ItemizedAnalysisResult<T> extends AnalysisResult {
 
 /**
  * Options for {@link analyzeItems}.
+ *
+ * `getLine` is required — there is no sensible default, so a TypeScript
+ * caller cannot write a call that is guaranteed to throw. The wire format
+ * comes from `config`, or from the bare `sessionLength` / `checksum` fields
+ * as a shorthand; the two forms are mutually exclusive and unknown keys
+ * raise a `TypeError`.
+ *
  * @public
  */
-export interface AnalyzeItemsOptions<T> {
-    /** Extract the base36 line from an item. */
-    getLine: (item: T, index: number) => string;
-    /** Optional wire-format override; must match the encoder. */
-    config?: ChunkConfig;
-}
-
+export type AnalyzeItemsOptions<T> =
+    | {
+          /** Extract the base36 line from an item. */
+          getLine: (item: T, index: number) => string;
+          /** Wire-format override; must match the encoder. */
+          config?: ChunkConfig | ResolvedConfig;
+          /** Mutually exclusive with `config` — enforced by `ensureOptionsConfig`. */
+          sessionLength?: never;
+          /** Mutually exclusive with `config` — enforced by `ensureOptionsConfig`. */
+          checksum?: never;
+      }
+    | {
+          /** Extract the base36 line from an item. */
+          getLine: (item: T, index: number) => string;
+          /** Mutually exclusive with the bare fields — enforced by `ensureOptionsConfig`. */
+          config?: never;
+          /** Shorthand for `config.sessionLength`. */
+          sessionLength?: 4 | 5 | 6 | 7 | 8;
+          /** Shorthand for `config.checksum`. */
+          checksum?: 'none' | 'crc8' | 'crc16';
+      };
 
 /**
  * Accumulator for one session during a single `analyzeLines` pass. Not part
@@ -357,4 +406,25 @@ export interface ChunkHeader {
     total: number;
     byteCount: number;
     checksumValue: number;
+}
+
+/**
+ * Internal summary produced by the shared `summarize()` helper in
+ * `analyze.js`. Not part of the public API — stripped from the emitted
+ * `.d.ts` by `stripInternal`.
+ *
+ * @internal
+ * @template T
+ * @template {ChunkIssue} E
+ */
+export interface SessionSummary<T, E extends ChunkIssue = ChunkIssue> {
+    complete: boolean;
+    expectedTotal: number | null;
+    totalMismatch: boolean;
+    chunks: Chunk[];
+    items: T[];
+    present: number[];
+    missing: number[];
+    duplicates: number[];
+    errors: E[];
 }

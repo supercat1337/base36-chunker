@@ -40,7 +40,7 @@ test('analyzeItems: getLine throwing Error lands in malformed with .item', t => 
 test('analyzeItems: getLine throwing non-Error uses String(err)', t => {
     const report = analyzeItems([{ id: 1 }], {
         getLine: () => {
-            throw 'plain string'; // eslint-disable-line no-throw-literal
+            throw 'plain string';  
         },
     });
     t.is(report.malformed.length, 1);

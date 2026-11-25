@@ -1,7 +1,42 @@
 // @ts-check
 
-import { DEFAULT_CONFIG, resolveConfig } from './config.js';
+import { ensureOptionsConfig } from './config.js';
 import { parseChunk, SESSION_PREFIX_RE } from './chunk.js';
+
+/**
+ * Human-readable message for an arbitrary thrown value.
+ *
+ * `parseChunk` only throws `Error` instances, but a user-supplied
+ * `getLine` may throw anything — including strings and numbers.
+ *
+ * @internal
+ * @param {unknown} err
+ * @returns {string}
+ */
+export function errorMessage(err) {
+    return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Deterministic, locale-independent comparator for base36 session ids.
+ *
+ * `localeCompare` is locale-dependent and slower; session ids are pure
+ * ASCII (`[0-9a-z]`), so a plain code-unit comparison is correct.
+ *
+ * @internal
+ * @param {string} a
+ * @param {string} b
+ * @returns {number} `-1`, `0`, or `1`.
+ */
+export function compareSessionIds(a, b) {
+    if (a < b) {
+        return -1;
+    }
+    if (a > b) {
+        return 1;
+    }
+    return 0;
+}
 
 /**
  * Most-frequent value in `values`. Returns `null` for empty input or a tied
@@ -11,10 +46,14 @@ import { parseChunk, SESSION_PREFIX_RE } from './chunk.js';
  * @returns {number | null}
  */
 function mode(values) {
-    if (values.length === 0) return null;
+    if (values.length === 0) {
+        return null;
+    }
     /** @type {Map<number, number>} */
     const counts = new Map();
-    for (const v of values) counts.set(v, (counts.get(v) ?? 0) + 1);
+    for (const v of values) {
+        counts.set(v, (counts.get(v) ?? 0) + 1);
+    }
     let bestCount = 0;
     /** @type {number | null} */
     let best = null;
@@ -32,24 +71,97 @@ function mode(values) {
 }
 
 /**
+ * Compute the per-session summary shared by `analyzeLines` and
+ * `analyzeItems`. Keeping one implementation is what guarantees that
+ * `items[j]` stays parallel to `chunks[j]`.
+ *
+ * Generic over the error type: `analyzeLines` passes `ChunkIssue[]`,
+ * `analyzeItems` passes `ItemizedChunkIssue<T>[]` — both extend
+ * `ChunkIssue`, so the body is identical.
+ *
+ * @internal
+ * @template T
+ * @template {import('./types.js').ChunkIssue} E
+ * @param {{ chunk: import('./types.js').Chunk, item: T }[]} entries
+ * @param {E[]} errors
+ * @returns {import('./types.js').SessionSummary<T, E>}
+ */
+function summarize(entries, errors) {
+    const chunks = entries.map(e => e.chunk);
+    const expectedTotal = mode(chunks.map(c => c.total));
+
+    /** @type {Map<number, number>} */
+    const indexCount = new Map();
+    for (const c of chunks) {
+        indexCount.set(c.index, (indexCount.get(c.index) ?? 0) + 1);
+    }
+
+    const present = [...indexCount.keys()].sort((a, b) => a - b);
+    const duplicates = [...indexCount.entries()]
+        .filter(([, count]) => count > 1)
+        .map(([idx]) => idx)
+        .sort((a, b) => a - b);
+
+    /** @type {number[]} */
+    const missing = [];
+    if (expectedTotal !== null) {
+        for (let idx = 0; idx < expectedTotal; idx += 1) {
+            if (!indexCount.has(idx)) {
+                missing.push(idx);
+            }
+        }
+    }
+
+    const totalMismatch = expectedTotal === null || chunks.some(c => c.total !== expectedTotal);
+
+    const complete =
+        errors.length === 0 &&
+        !totalMismatch &&
+        missing.length === 0 &&
+        duplicates.length === 0 &&
+        chunks.length === expectedTotal;
+
+    // Sort entries once — `chunks` and `items` come out in lockstep.
+    const sorted = [...entries].sort((a, b) => a.chunk.index - b.chunk.index);
+
+    return {
+        complete,
+        expectedTotal,
+        totalMismatch,
+        chunks: sorted.map(e => e.chunk),
+        items: sorted.map(e => e.item),
+        present,
+        missing,
+        duplicates,
+        errors: [...errors].sort((a, b) => a.line - b.line),
+    };
+}
+
+/**
  * Analyze an array of encoded lines, grouping by session and reporting
  * completeness per session.
  *
  * Never throws on malformed input: bad lines, missing chunks, duplicates,
  * total mismatches, and checksum failures are surfaced in the returned
- * report. Only a non-array `lines` argument raises `TypeError`.
+ * report. Only a non-array `lines` argument — or an invalid `options` /
+ * `config` — raises.
  *
  * @public
  * @param {string[]} lines
- * @param {import("./types.js").AnalyzeOptions} [options]
+ * @param {import("./types.js").ConfigOptions} [options]
+ *        Either `{ config: {...} }`, or a config passed directly. Both forms
+ *        resolve to the same wire format; an unknown option key is a
+ *        `TypeError` rather than a silent fallback to the defaults.
  * @returns {import("./types.js").AnalysisResult}
- * @throws {TypeError} If `lines` is not an array.
+ * @throws {TypeError} If `lines` is not an array, `options` is not an object,
+ *                     or an option/config field is unknown.
+ * @throws {RangeError} If `config` fields are out of range.
  */
-export function analyzeLines(lines, options = {}) {
+export function analyzeLines(lines, options) {
     if (!Array.isArray(lines)) {
         throw new TypeError('Expected an array of lines');
     }
-    const config = options.config ? resolveConfig(options.config) : DEFAULT_CONFIG;
+    const config = ensureOptionsConfig(options);
 
     /** @type {import("./types.js").ChunkIssue[]} */
     const malformed = [];
@@ -79,10 +191,7 @@ export function analyzeLines(lines, options = {}) {
         try {
             bucket.chunks.push(parseChunk(line, config));
         } catch (err) {
-            bucket.errors.push({
-                line: i,
-                reason: err instanceof Error ? err.message : String(err),
-            });
+            bucket.errors.push({ line: i, reason: errorMessage(err) });
         }
     }
 
@@ -90,49 +199,23 @@ export function analyzeLines(lines, options = {}) {
     const sessions = [];
 
     for (const bucket of buckets.values()) {
-        const expectedTotal = mode(bucket.chunks.map(c => c.total));
-
-        /** @type {Map<number, number>} */
-        const indexCount = new Map();
-        for (const chunk of bucket.chunks) {
-            indexCount.set(chunk.index, (indexCount.get(chunk.index) ?? 0) + 1);
-        }
-
-        const present = [...indexCount.keys()].sort((a, b) => a - b);
-        const duplicates = present.filter(idx => (indexCount.get(idx) ?? 0) > 1);
-
-        /** @type {number[]} */
-        const missing = [];
-        if (expectedTotal !== null) {
-            for (let idx = 0; idx < expectedTotal; idx += 1) {
-                if (!indexCount.has(idx)) missing.push(idx);
-            }
-        }
-
-        const totalMismatch =
-            expectedTotal === null || bucket.chunks.some(c => c.total !== expectedTotal);
-
-        const complete =
-            bucket.errors.length === 0 &&
-            !totalMismatch &&
-            missing.length === 0 &&
-            duplicates.length === 0 &&
-            bucket.chunks.length === expectedTotal;
-
+        const entries = bucket.chunks.map(chunk => ({ chunk, item: undefined }));
+        const s = summarize(entries, bucket.errors);
         sessions.push({
             sessionId: bucket.sessionId,
-            complete,
-            expectedTotal,
-            totalMismatch,
-            chunks: [...bucket.chunks].sort((a, b) => a.index - b.index),
-            present,
-            missing,
-            duplicates,
-            errors: bucket.errors,
+            complete: s.complete,
+            expectedTotal: s.expectedTotal,
+            totalMismatch: s.totalMismatch,
+            chunks: s.chunks,
+            present: s.present,
+            missing: s.missing,
+            duplicates: s.duplicates,
+            errors: s.errors,
         });
     }
 
-    sessions.sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+    sessions.sort((a, b) => compareSessionIds(a.sessionId, b.sessionId));
+    malformed.sort((a, b) => a.line - b.line);
 
     const ok = malformed.length === 0 && sessions.every(s => s.complete);
     return { ok, sessions, malformed };
@@ -169,8 +252,8 @@ export function incompleteSessions(report) {
  * object that produced `chunks[i]`. `malformed` and `errors` entries carry
  * the offending item as `.item`.
  *
- * Never throws on bad data. Only a non-array `items` or a non-function
- * `getLine` raises `TypeError`.
+ * Never throws on bad data. Only a non-array `items`, a non-function
+ * `getLine`, or an invalid `config` raises.
  *
  * @example
  *   const rows = await db.select("SELECT id, chunk FROM chunks");
@@ -188,17 +271,22 @@ export function incompleteSessions(report) {
  * @param {T[]} items
  * @param {import("./types.js").AnalyzeItemsOptions<T>} options
  * @returns {import("./types.js").ItemizedAnalysisResult<T>}
- * @throws {TypeError} If `items` is not an array or `getLine` is not a function.
+ * @throws {TypeError} If `items` is not an array, `getLine` is not a
+ *                     function, or a config/option field is unknown.
+ * @throws {RangeError} If `config` fields are out of range.
  */
 export function analyzeItems(items, options) {
     if (!Array.isArray(items)) {
         throw new TypeError('Expected an array of items');
     }
-    const { getLine, config: userConfig } = options;
+    // `options` is required by the type, but JS callers may still pass
+    // `undefined` — keep the optional chain so the error message stays
+    // useful instead of "Cannot read properties of undefined".
+    const getLine = options?.getLine;
     if (typeof getLine !== 'function') {
         throw new TypeError('getLine must be a function');
     }
-    const config = userConfig ? resolveConfig(userConfig) : DEFAULT_CONFIG;
+    const config = ensureOptionsConfig(options, ['getLine']);
 
     /** @type {import("./types.js").ItemizedChunkIssue<T>[]} */
     const malformed = [];
@@ -215,7 +303,7 @@ export function analyzeItems(items, options) {
             malformed.push({
                 item,
                 line: i,
-                reason: `getLine threw: ${err instanceof Error ? err.message : String(err)}`,
+                reason: `getLine threw: ${errorMessage(err)}`,
             });
             continue;
         }
@@ -245,11 +333,7 @@ export function analyzeItems(items, options) {
             const chunk = parseChunk(line, config);
             bucket.entries.push({ chunk, item });
         } catch (err) {
-            bucket.errors.push({
-                item,
-                line: i,
-                reason: err instanceof Error ? err.message : String(err),
-            });
+            bucket.errors.push({ item, line: i, reason: errorMessage(err) });
         }
     }
 
@@ -257,53 +341,24 @@ export function analyzeItems(items, options) {
     const sessions = [];
 
     for (const bucket of buckets.values()) {
-        const chunksArr = bucket.entries.map(e => e.chunk);
-        const expectedTotal = mode(chunksArr.map(c => c.total));
-
-        /** @type {Map<number, number>} */
-        const indexCount = new Map();
-        for (const c of chunksArr) {
-            indexCount.set(c.index, (indexCount.get(c.index) ?? 0) + 1);
-        }
-        const present = [...indexCount.keys()].sort((a, b) => a - b);
-        const duplicates = present.filter(idx => (indexCount.get(idx) ?? 0) > 1);
-
-        /** @type {number[]} */
-        const missing = [];
-        if (expectedTotal !== null) {
-            for (let idx = 0; idx < expectedTotal; idx += 1) {
-                if (!indexCount.has(idx)) missing.push(idx);
-            }
-        }
-
-        const totalMismatch =
-            expectedTotal === null || chunksArr.some(c => c.total !== expectedTotal);
-
-        const complete =
-            bucket.errors.length === 0 &&
-            !totalMismatch &&
-            missing.length === 0 &&
-            duplicates.length === 0 &&
-            chunksArr.length === expectedTotal;
-
-        // Sort entries once — both `chunks` and `items` come out in lockstep.
-        const sorted = [...bucket.entries].sort((a, b) => a.chunk.index - b.chunk.index);
-
+        const s = summarize(bucket.entries, bucket.errors);
         sessions.push({
             sessionId: bucket.sessionId,
-            complete,
-            expectedTotal,
-            totalMismatch,
-            chunks: sorted.map(e => e.chunk),
-            items: sorted.map(e => e.item),
-            present,
-            missing,
-            duplicates,
-            errors: bucket.errors,
+            complete: s.complete,
+            expectedTotal: s.expectedTotal,
+            totalMismatch: s.totalMismatch,
+            chunks: s.chunks,
+            items: s.items,
+            present: s.present,
+            missing: s.missing,
+            duplicates: s.duplicates,
+            errors: s.errors,
         });
     }
 
-    sessions.sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+    sessions.sort((a, b) => compareSessionIds(a.sessionId, b.sessionId));
+    malformed.sort((a, b) => a.line - b.line);
+
     const ok = malformed.length === 0 && sessions.every(s => s.complete);
     return { ok, sessions, malformed };
 }
